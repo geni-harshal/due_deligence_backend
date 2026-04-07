@@ -8,6 +8,7 @@ import com.entitycheck.api.dto.SsoSessionResponse;
 import com.entitycheck.probe.Probe42Client;
 import com.entitycheck.service.PdfService;
 import com.entitycheck.service.ReportMapper;
+import com.entitycheck.service.ComprehensiveDataService;
 import com.entitycheck.storage.ReportCacheEntity;
 import com.entitycheck.storage.ReportCacheRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -47,6 +48,7 @@ public class ReportController {
   private final PdfService pdfService;
   private final ReportCacheRepository cacheRepository;
   private final ObjectMapper objectMapper;
+  private final ComprehensiveDataService comprehensiveDataService;
   private final Map<String, Map<String, Object>> memoryReports = new ConcurrentHashMap<>();
   private final Map<String, Map<String, Object>> taskStatus = new ConcurrentHashMap<>();
 
@@ -79,13 +81,15 @@ public class ReportController {
       ReportMapper reportMapper,
       PdfService pdfService,
       ReportCacheRepository cacheRepository,
-      ObjectMapper objectMapper
+      ObjectMapper objectMapper,
+      ComprehensiveDataService comprehensiveDataService
   ) {
     this.probe42Client = probe42Client;
     this.reportMapper = reportMapper;
     this.pdfService = pdfService;
     this.cacheRepository = cacheRepository;
     this.objectMapper = objectMapper;
+    this.comprehensiveDataService = comprehensiveDataService;
   }
 
   @GetMapping("/")
@@ -383,6 +387,87 @@ public class ReportController {
       return ResponseEntity.status(500).body(Map.of("detail", "PDF generation failed"));
     }
   }
+
+  // ========================================
+  // COMPREHENSIVE DATA ENDPOINTS
+  // ========================================
+
+  /**
+   * Fetch comprehensive data from Probe42 and store in database
+   */
+  @PostMapping("/comprehensive/fetch/{cin}")
+  public ResponseEntity<?> fetchComprehensive(@PathVariable String cin) {
+    try {
+      Map<String, Object> result = comprehensiveDataService.fetchAndStore(cin);
+      
+      if (result.containsKey("error")) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(result);
+      }
+      
+      return ResponseEntity.ok(result);
+      
+    } catch (Exception e) {
+      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+              .body(Map.of("error", "Failed to fetch comprehensive data: " + e.getMessage()));
+    }
+  }
+
+  /**
+   * Get comprehensive data from database
+   */
+  @GetMapping("/comprehensive/{cin}")
+  public ResponseEntity<?> getComprehensive(@PathVariable String cin) {
+    try {
+      Map<String, Object> result = comprehensiveDataService.getData(cin);
+      
+      if (result.containsKey("error")) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(result);
+      }
+      
+      return ResponseEntity.ok(result);
+      
+    } catch (Exception e) {
+      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+              .body(Map.of("error", "Failed to retrieve comprehensive data: " + e.getMessage()));
+    }
+  }
+
+  /**
+   * Refresh comprehensive data - fetch fresh from API
+   */
+  @PostMapping("/comprehensive/refresh/{cin}")
+  public ResponseEntity<?> refreshComprehensive(@PathVariable String cin) {
+    try {
+      Map<String, Object> result = comprehensiveDataService.refreshData(cin);
+      
+      if (result.containsKey("error")) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(result);
+      }
+      
+      return ResponseEntity.ok(result);
+      
+    } catch (Exception e) {
+      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+              .body(Map.of("error", "Failed to refresh comprehensive data: " + e.getMessage()));
+    }
+  }
+
+  /**
+   * Check if comprehensive data exists for a CIN
+   */
+  @GetMapping("/comprehensive/exists/{cin}")
+  public ResponseEntity<?> checkComprehensiveExists(@PathVariable String cin) {
+    try {
+      boolean exists = comprehensiveDataService.exists(cin);
+      return ResponseEntity.ok(Map.of("exists", exists, "cin", cin));
+    } catch (Exception e) {
+      return ResponseEntity.ok(Map.of("exists", false, "cin", cin, "error", e.getMessage()));
+    }
+  }
+
+  // ========================================
+  // PRIVATE HELPER METHODS
+  // ========================================
 
   private Map<String, Object> loadCached(String identifier) {
     try {

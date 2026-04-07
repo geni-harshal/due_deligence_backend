@@ -15,6 +15,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
+import com.entitycheck.service.ComprehensiveDataService;
 
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
@@ -23,6 +24,7 @@ import java.util.*;
 @RestController
 @RequestMapping("/api/operations")
 public class OperationsOrderController {
+    private final ComprehensiveDataService comprehensiveDataService;
 
     private static final Logger log = LoggerFactory.getLogger(OperationsOrderController.class);
 
@@ -36,29 +38,32 @@ public class OperationsOrderController {
     private final DecisionEngineService decisionEngineService;
     private final OrderPdfService orderPdfService;
     private final ObjectMapper objectMapper;
-
-    public OperationsOrderController(OrderRepository orderRepository,
-                                      ClientCompanyRepository clientCompanyRepository,
-                                      ProviderSearchSnapshotRepository snapshotRepository,
-                                      AnalystEnrichmentRepository enrichmentRepository,
-                                      GeneratedDocumentRepository documentRepository,
-                                      Probe42Client probe42Client,
-                                      ReportDataService reportDataService,
-                                      DecisionEngineService decisionEngineService,
-                                      OrderPdfService orderPdfService,
-                                      ObjectMapper objectMapper) {
-        this.orderRepository = orderRepository;
-        this.clientCompanyRepository = clientCompanyRepository;
-        this.snapshotRepository = snapshotRepository;
-        this.enrichmentRepository = enrichmentRepository;
-        this.documentRepository = documentRepository;
-        this.probe42Client = probe42Client;
-        this.reportDataService = reportDataService;
-        this.decisionEngineService = decisionEngineService;
-        this.orderPdfService = orderPdfService;
-        this.objectMapper = objectMapper;
-    }
-
+    
+public OperationsOrderController(
+        OrderRepository orderRepository,
+        ClientCompanyRepository clientCompanyRepository,
+        ProviderSearchSnapshotRepository snapshotRepository,
+        AnalystEnrichmentRepository enrichmentRepository,
+        GeneratedDocumentRepository documentRepository,
+        Probe42Client probe42Client,
+        ReportDataService reportDataService,
+        DecisionEngineService decisionEngineService,
+        OrderPdfService orderPdfService,
+        ObjectMapper objectMapper,
+        ComprehensiveDataService comprehensiveDataService
+) {
+    this.orderRepository = orderRepository;
+    this.clientCompanyRepository = clientCompanyRepository;
+    this.snapshotRepository = snapshotRepository;
+    this.enrichmentRepository = enrichmentRepository;
+    this.documentRepository = documentRepository;
+    this.probe42Client = probe42Client;
+    this.reportDataService = reportDataService;
+    this.decisionEngineService = decisionEngineService;
+    this.orderPdfService = orderPdfService;
+    this.objectMapper = objectMapper;
+    this.comprehensiveDataService = comprehensiveDataService;
+}
     // ── GET /api/operations/orders ──
     @GetMapping("/orders")
     public ResponseEntity<List<Map<String, Object>>> listOrders(
@@ -115,10 +120,39 @@ public class OperationsOrderController {
         // Attach provider search snapshot
         snapshotRepository.findByOrderId(id).ifPresent(snap -> {
             try {
+                Map<String, Object> transformed =
+                        objectMapper.readValue(
+                                snap.getTransformedReportJson(),
+                                new TypeReference<Map<String, Object>>() {}
+                        );
+
                 Map<String, Object> snapshotData = new LinkedHashMap<>();
-                snapshotData.put("rawResults", objectMapper.readValue(snap.getTransformedReportJson(),
-                        new TypeReference<Map<String, Object>>() {}));
+
+                // exact frontend-friendly shape
+                Object versionInfo = transformed.get("versionInfo");
+                if (versionInfo == null) {
+                    versionInfo = Map.of(
+                            "version", 1,
+                            "provider", "PROBE42",
+                            "fetchedAt", OffsetDateTime.now().toString(),
+                            "fetchedBy", "operations"
+                    );
+                }
+
+                snapshotData.put("versionInfo", versionInfo);
+                snapshotData.put("metadata", transformed.get("metadata"));
+
+                Object data = transformed.get("data");
+                if (data == null) {
+                    Map<String, Object> fallback = new LinkedHashMap<>(transformed);
+                    fallback.remove("metadata");
+                    fallback.remove("versionInfo");
+                    data = fallback;
+                }
+
+                snapshotData.put("data", data);
                 result.put("providerSearchSnapshot", snapshotData);
+
             } catch (Exception e) {
                 log.warn("Failed to parse snapshot for order {}", id, e);
             }
@@ -160,93 +194,38 @@ public class OperationsOrderController {
     }
 
     // ── POST /api/operations/orders/{id}/fetch-data ──
-    @PostMapping("/orders/{id}/fetch-data")
-    public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
-        Order order = orderRepository.findByIdWithDetails(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+@PostMapping("/orders/{id}/fetch-data")
+public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
+    Order order = orderRepository.findByIdWithDetails(id)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        // Get the CIN/identifier from subject details
-        String cin = extractCin(order);
-        String companyName = order.getSubjectName();
-
-        log.info("Fetching comprehensive data for order {} - CIN: {}, Company: {}", id, cin, companyName);
-
-        Map<String, Object> reportData;
-
-        try {
-            // Call Probe42 API for comprehensive report
-            JsonNode raw = probe42Client.getComprehensiveByIdentifier(cin);
-
-            if (raw != null) {
-                // Store raw result
-                String rawJson = objectMapper.writeValueAsString(raw);
-
-                // Transform to frontend format
-                reportData = reportDataService.transformToReport(raw, companyName, cin);
-                String transformedJson = objectMapper.writeValueAsString(reportData);
-
-                // Upsert snapshot
-                ProviderSearchSnapshot snapshot = snapshotRepository.findByOrderId(id)
-                        .orElseGet(() -> {
-                            ProviderSearchSnapshot s = new ProviderSearchSnapshot();
-                            s.setOrder(order);
-                            return s;
-                        });
-                snapshot.setRawResultsJson(rawJson);
-                snapshot.setTransformedReportJson(transformedJson);
-                snapshot.setFetchedAt(OffsetDateTime.now());
-                snapshotRepository.save(snapshot);
-            } else {
-                // Probe42 returned nothing - generate mock report for demo
-                log.warn("Probe42 returned no data for CIN: {}. Generating mock report.", cin);
-                reportData = reportDataService.transformToReport(
-                        objectMapper.createObjectNode(), companyName, cin);
-                String transformedJson = objectMapper.writeValueAsString(reportData);
-
-                ProviderSearchSnapshot snapshot = snapshotRepository.findByOrderId(id)
-                        .orElseGet(() -> {
-                            ProviderSearchSnapshot s = new ProviderSearchSnapshot();
-                            s.setOrder(order);
-                            return s;
-                        });
-                snapshot.setRawResultsJson("{}");
-                snapshot.setTransformedReportJson(transformedJson);
-                snapshot.setFetchedAt(OffsetDateTime.now());
-                snapshotRepository.save(snapshot);
-            }
-        } catch (Exception e) {
-            log.error("Failed to fetch from Probe42 for order {}, generating mock data", id, e);
-            // Fallback: generate mock report
-            try {
-                reportData = reportDataService.transformToReport(
-                        objectMapper.createObjectNode(), companyName, cin);
-                String transformedJson = objectMapper.writeValueAsString(reportData);
-
-                ProviderSearchSnapshot snapshot = snapshotRepository.findByOrderId(id)
-                        .orElseGet(() -> {
-                            ProviderSearchSnapshot s = new ProviderSearchSnapshot();
-                            s.setOrder(order);
-                            return s;
-                        });
-                snapshot.setRawResultsJson("{}");
-                snapshot.setTransformedReportJson(transformedJson);
-                snapshot.setFetchedAt(OffsetDateTime.now());
-                snapshotRepository.save(snapshot);
-            } catch (Exception ex) {
-                throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to fetch company data");
-            }
-        }
-
-        // Update order status
-        order.setStatus(OrderStatus.DATA_FETCHED);
-        orderRepository.save(order);
-
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("report", reportData);
-        response.put("status", "data_fetched");
-        return ResponseEntity.ok(response);
+    String identifier = extractCin(order);
+    if (identifier == null || identifier.isBlank()) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
     }
 
+    Map<String, Object> saved;
+    try {
+        saved = comprehensiveDataService.fetchAndStoreFresh(
+                order,
+                identifier,
+                "operations"
+        );
+    } catch (RuntimeException ex) {
+        throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, ex.getMessage());
+    }
+
+    order.setStatus(OrderStatus.DATA_FETCHED);
+    orderRepository.save(order);
+
+    Map<String, Object> response = new LinkedHashMap<>();
+    response.put("status", "data_fetched");
+    response.put("latest", saved);
+    response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
+    response.put("versions", comprehensiveDataService.getVersions(id));
+
+    return ResponseEntity.ok(response);
+}
     // ── PUT /api/operations/orders/{id}/enrichment ──
     @PutMapping("/orders/{id}/enrichment")
     public ResponseEntity<Map<String, Object>> saveEnrichment(@PathVariable Long id,
@@ -297,17 +276,18 @@ public class OperationsOrderController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         // Get the transformed report data
-        ProviderSearchSnapshot snapshot = snapshotRepository.findByOrderId(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                        "No company data fetched yet. Please fetch data first."));
+        Map<String, Object> latest = comprehensiveDataService.getLatest(id);
 
-        Map<String, Object> reportData;
-        try {
-            reportData = objectMapper.readValue(snapshot.getTransformedReportJson(),
-                    new TypeReference<Map<String, Object>>() {});
-        } catch (Exception e) {
-            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to parse report data");
+        if (latest == null || latest.get("report") == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "No company data fetched yet. Please fetch data first."
+            );
         }
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> reportData =
+        (Map<String, Object>) latest.get("report");
 
         // Run decision engine
         Map<String, Object> decisionOutputs = decisionEngineService.execute(reportData);
@@ -340,16 +320,18 @@ public class OperationsOrderController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         // Get report data
-        ProviderSearchSnapshot snapshot = snapshotRepository.findByOrderId(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST, "No company data"));
+       Map<String, Object> latest = comprehensiveDataService.getLatest(id);
 
-        Map<String, Object> reportData;
-        try {
-            reportData = objectMapper.readValue(snapshot.getTransformedReportJson(),
-                    new TypeReference<Map<String, Object>>() {});
-        } catch (Exception e) {
-            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to parse report data");
-        }
+if (latest == null || latest.get("report") == null) {
+    throw new ResponseStatusException(
+            HttpStatus.BAD_REQUEST,
+            "No company data fetched yet. Please fetch data first."
+    );
+}
+
+@SuppressWarnings("unchecked")
+Map<String, Object> reportData =
+        (Map<String, Object>) latest.get("report");
 
         // Get enrichment
         AnalystEnrichment enrichment = enrichmentRepository.findByOrderId(id).orElse(null);
@@ -492,6 +474,18 @@ public class OperationsOrderController {
                         new TypeReference<Map<String, Object>>() {});
                 String cin = strVal(details.get("cin"));
                 if (!cin.isBlank()) return cin;
+
+                String identifier = strVal(details.get("identifier"));
+                if (!identifier.isBlank()) return identifier;
+
+                String pan = strVal(details.get("pan"));
+                if (!pan.isBlank()) return pan;
+
+                String llpin = strVal(details.get("llpin"));
+                if (!llpin.isBlank()) return llpin;
+
+                String bid = strVal(details.get("bid"));
+                if (!bid.isBlank()) return bid;
             } catch (Exception ignored) {}
         }
         // Fallback to subject name as identifier

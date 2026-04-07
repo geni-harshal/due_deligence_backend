@@ -37,12 +37,35 @@ public class SecurityConfig {
             .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .csrf(csrf -> csrf.disable())
             .authorizeHttpRequests(auth -> auth
+                // Public endpoints - no authentication required
                 .requestMatchers(
                     "/api/auth/login",
                     "/api/auth/logout",
-                    "/api/health"
+                    "/api/health",
+                    "/error",
+                    "/swagger-ui.html",
+                    "/swagger-ui/**",
+                    "/v3/api-docs/**",
+                    "/v3/api-docs"
                 ).permitAll()
-                // All other /api/** require authentication (JWT)
+                
+                // NEW: Comprehensive Request System Endpoints
+                // ✅ Client endpoints - require CLIENT roles
+                .requestMatchers("/api/v1/client/comprehensive-requests/**")
+                    .hasAnyRole("CLIENT_USER", "CLIENT_ADMIN")
+                
+                // ✅ Operations endpoints - require OPERATIONS roles
+                .requestMatchers("/api/v1/operations/comprehensive-requests/**")
+                    .hasAnyRole("OPERATIONS_USER", "OPERATIONS_REVIEWER")
+                
+                // ✅ Audit logs - require OPERATIONS roles
+                .requestMatchers("/api/v1/operations/audit-logs/**")
+                    .hasAnyRole("OPERATIONS_USER", "OPERATIONS_REVIEWER")
+                
+                // All other API endpoints require authentication
+                .requestMatchers("/api/**").authenticated()
+                
+                // All other requests require authentication
                 .anyRequest().authenticated()
             )
             .sessionManagement(session -> session
@@ -64,10 +87,11 @@ public class SecurityConfig {
             "http://localhost:5174",
             "http://localhost:3000"
         ));
-        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("*"));
         configuration.setAllowCredentials(true);
         configuration.setExposedHeaders(List.of("Authorization"));
+        
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);
         return source;

@@ -229,44 +229,57 @@ public class Probe42Client {
     return out.size() > limit ? out.subList(0, limit) : out;
   }
 
-  public JsonNode getComprehensiveByIdentifier(String identifier) throws IOException, InterruptedException {
+public JsonNode getComprehensiveByIdentifier(String identifier) throws IOException, InterruptedException {
     String id = identifier == null ? "" : identifier.trim();
     if (id.isBlank()) return null;
 
     String upper = id.toUpperCase();
     List<String> urls = new ArrayList<>();
+    
     if (PAN_PATTERN.matcher(upper).matches()) {
-      // Required Probe path for partnership/proprietorship by PAN.
-      urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details?identifier_type=PAN".formatted(baseUrl, upper));
+        urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details?identifier_type=PAN".formatted(baseUrl, upper));
     } else if (LLPIN_PATTERN.matcher(upper).matches()) {
-      // Required Probe path for LLP.
-      urls.add("%s/probe_pro_sandbox/llps/%s/comprehensive-details".formatted(baseUrl, upper));
+        urls.add("%s/probe_pro_sandbox/llps/%s/comprehensive-details".formatted(baseUrl, upper));
     } else if (CIN_PATTERN.matcher(upper).matches()) {
-      urls.add("%s/probe_pro_sandbox/companies/%s/comprehensive-details".formatted(baseUrl, upper));
+        urls.add("%s/probe_pro_sandbox/companies/%s/comprehensive-details".formatted(baseUrl, upper));
     } else {
-      // BID/unknown fallback used only when identifier type is not explicit.
-      urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details?identifier_type=BID".formatted(baseUrl, id));
-      urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details".formatted(baseUrl, id));
-      urls.add("%s/probe_pro_sandbox/companies/%s/comprehensive-details".formatted(baseUrl, id));
-      urls.add("%s/probe_pro_sandbox/llps/%s/comprehensive-details".formatted(baseUrl, id));
-      urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details?identifier_type=PAN".formatted(baseUrl, id));
+        urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details?identifier_type=BID".formatted(baseUrl, id));
+        urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details".formatted(baseUrl, id));
+        urls.add("%s/probe_pro_sandbox/companies/%s/comprehensive-details".formatted(baseUrl, id));
+        urls.add("%s/probe_pro_sandbox/llps/%s/comprehensive-details".formatted(baseUrl, id));
+        urls.add("%s/probe_pro_sandbox/pnps/%s/comprehensive-details?identifier_type=PAN".formatted(baseUrl, id));
     }
+    
     for (String url : urls) {
-      HttpRequest request = HttpRequest.newBuilder()
-          .uri(URI.create(url))
-          .timeout(Duration.ofSeconds(45))
-          .header("x-api-key", apiKey)
-          .header("Accept", "application/json")
-          .header("x-api-version", apiVersion)
-          .GET()
-          .build();
-      HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-      if (response.statusCode() >= 200 && response.statusCode() < 300) {
-        return mapper.readTree(response.body());
-      }
+        log.info("Probe42 API call: {}", url);
+        
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .timeout(Duration.ofSeconds(45))
+            .header("x-api-key", apiKey)
+            .header("Accept", "application/json")
+            .header("x-api-version", apiVersion)
+            .GET()
+            .build();
+            
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        
+        log.info("Probe42 response status: {} for URL: {}", response.statusCode(), url);
+        
+        if (response.statusCode() >= 200 && response.statusCode() < 300) {
+            return mapper.readTree(response.body());
+        } else if (response.statusCode() == 403) {
+            log.error("Probe42 API returned 403 Forbidden. Check API key validity. Response: {}", response.body());
+            throw new RuntimeException("Probe42 API authentication failed (403). Please check your API key.");
+        } else if (response.statusCode() == 401) {
+            log.error("Probe42 API returned 401 Unauthorized. Response: {}", response.body());
+            throw new RuntimeException("Probe42 API unauthorized (401). Please check your API key.");
+        } else {
+            log.warn("Probe42 API returned {} for URL: {}. Response: {}", response.statusCode(), url, response.body());
+        }
     }
     return null;
-  }
+}
 
   public String resolvePanFromBid(String bid) throws IOException, InterruptedException {
     if (bid == null || bid.trim().isBlank()) return null;

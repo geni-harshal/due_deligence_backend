@@ -1,0 +1,77 @@
+# ============================================================
+# COMPREHENSIVE REQUEST SYSTEM SPECIFIC CONFIGURATION
+# This file is loaded when profile "comprehensive" is active
+# ============================================================
+
+# ============================================================
+# COMPREHENSIVE REQUEST SYSTEM SETTINGS
+# ============================================================
+comprehensive:
+  request:
+    duplicate-check-minutes: 5
+    request-timeout-seconds: 30
+    max-requests-per-day: 100
+  
+  api:
+    default-page-size: 20
+    max-page-size: 100
+  
+  audit:
+    retention-days: 730
+    enabled: true
+    log-request-details: true
+
+# ============================================================
+# PROBE42 API CONFIGURATION
+# ============================================================
+probe42:
+  base-url: ${PROBE42_BASE_URL:https://api.probe42.in}
+  api-key: ${PROBE42_API_KEY:yMyK3vWVqe6l5qWqzFflg4TGxLS4Ll9XaobXUZjy}
+  api-version: ${PROBE42_API_VERSION:1.3}
+  connect-timeout: 30
+  read-timeout: 45
+  retry:
+    max-attempts: 3
+    initial-backoff-ms: 1000
+    backoff-multiplier: 2.0
+    max-backoff-ms: 30000
+
+# ============================================================
+# ASYNC PROCESSING
+# ============================================================
+spring:
+  task:
+    execution:
+      pool:
+        core-size: 5
+        max-size: 20
+        queue-capacity: 100
+        thread-name-prefix: probe42-
+    scheduling:
+      pool:
+        size: 3
+        thread-name-prefix: comp-req-sched-
+
+# ============================================================
+# SUPPORT CONTACT
+# ============================================================
+support:
+  contact-number: ${SUPPORT_CONTACT_NUMBER:+91 9876543210}
+
+# ============================================================
+# NOTE: NO REDIS CACHE CONFIGURED
+# When ready to add Redis:
+# 1. Install Redis server
+# 2. Uncomment the redis section below
+# 3. Restart application
+# ============================================================
+
+# FUTURE: Add this section when Redis is installed
+# spring:
+#   cache:
+#     type: redis
+#     redis:
+#       time-to-live: 300000
+#   redis:
+#     host: ${REDIS_HOST:localhost}
+#     port: ${REDIS_PORT:6379}
