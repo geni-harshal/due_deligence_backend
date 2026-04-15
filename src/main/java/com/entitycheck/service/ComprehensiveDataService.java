@@ -47,14 +47,10 @@ public class ComprehensiveDataService {
         if ((raw == null || raw.isNull()) && order != null && order.getSubjectName() != null && !order.getSubjectName().isBlank()) {
             List<CompanySearchResult> candidates = probe42IntegrationService.searchByNamePrefix(order.getSubjectName(), 5);
             for (CompanySearchResult candidate : candidates) {
-                if (candidate == null || candidate.cin() == null || candidate.cin().isBlank()) {
-                    continue;
-                }
+                if (candidate == null || candidate.cin() == null || candidate.cin().isBlank()) continue;
                 effectiveIdentifier = candidate.cin();
                 raw = probe42IntegrationService.fetchComprehensive(effectiveIdentifier);
-                if (raw != null && !raw.isNull()) {
-                    break;
-                }
+                if (raw != null && !raw.isNull()) break;
             }
         }
 
@@ -64,13 +60,6 @@ public class ComprehensiveDataService {
 
         try {
             String rawJson = objectMapper.writeValueAsString(raw);
-
-            Map<String, Object> transformed = reportDataService.transformToReport(
-                    raw,
-                    order.getSubjectName(),
-                    effectiveIdentifier
-            );
-            String transformedJson = objectMapper.writeValueAsString(transformed);
 
             int nextVersion = rawRepository
                     .findTopByOrder_IdOrderByVersionDesc(order.getId())
@@ -86,7 +75,6 @@ public class ComprehensiveDataService {
             snapshot.setCin(effectiveIdentifier);
             snapshot.setCompanyName(companyName);
             snapshot.setRawJson(rawJson);
-            snapshot.setTransformedJson(transformedJson);
             snapshot.setFetchedBy(fetchedBy);
             snapshot.setFetchedAt(OffsetDateTime.now());
 
@@ -100,21 +88,14 @@ public class ComprehensiveDataService {
                     });
 
             latestCache.setRawResultsJson(rawJson);
-            latestCache.setTransformedReportJson(transformedJson);
             latestCache.setFetchedAt(saved.getFetchedAt());
             latestCacheRepository.save(latestCache);
 
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("orderId", order.getId());
-            response.put("version", saved.getVersion());
-            response.put("provider", saved.getProvider());
-            response.put("cin", saved.getCin());
-            response.put("requestedIdentifier", identifier);
-            response.put("companyName", saved.getCompanyName());
-            response.put("fetchedAt", saved.getFetchedAt().toString());
-            response.put("rawResults", raw);
-            response.put("report", transformed);
-
+            response.put("latestSnapshot", snapshotSummaryToMap(saved));
+            response.put("versions", getVersions(order.getId()));
+            response.put("snapshotData", objectMapper.readValue(rawJson, Object.class));
             return response;
         } catch (Exception e) {
             throw new RuntimeException("Failed to store fresh comprehensive data", e);
@@ -124,7 +105,6 @@ public class ComprehensiveDataService {
     public Map<String, Object> getLatest(Long orderId) {
         RawComprehensiveData latest = rawRepository.findTopByOrder_IdOrderByVersionDesc(orderId).orElse(null);
         if (latest == null) return null;
-
         return snapshotToMap(latest);
     }
 
@@ -132,7 +112,7 @@ public class ComprehensiveDataService {
         List<RawComprehensiveData> versions = rawRepository.findByOrder_IdOrderByVersionDesc(orderId);
         List<Map<String, Object>> out = new ArrayList<>();
         for (RawComprehensiveData s : versions) {
-            out.add(snapshotVersionToMap(s));
+            out.add(snapshotSummaryToMap(s));
         }
         return out;
     }
@@ -169,55 +149,38 @@ public class ComprehensiveDataService {
     }
 
     public Map<String, Object> fetchAndStore(String cin) {
-    try {
-        JsonNode raw = probe42IntegrationService.fetchComprehensive(cin);
+        try {
+            JsonNode raw = probe42IntegrationService.fetchComprehensive(cin);
+            if (raw == null || raw.isNull()) {
+                return Map.of("error", "No data found for CIN: " + cin);
+            }
 
-        if (raw == null || raw.isNull()) {
-            return Map.of("error", "No data found for CIN: " + cin);
+            String rawJson = objectMapper.writeValueAsString(raw);
+            return Map.of(
+                    "cin", cin,
+                    "snapshotData", objectMapper.readValue(rawJson, Object.class),
+                    "fetchedAt", OffsetDateTime.now().toString()
+            );
+        } catch (Exception e) {
+            return Map.of("error", "Failed to fetch data: " + e.getMessage());
         }
-
-        String rawJson = objectMapper.writeValueAsString(raw);
-
-        Map<String, Object> transformed = reportDataService.transformToReport(
-                raw,
-                extractCompanyName(raw, cin),
-                cin
-        );
-
-        return Map.of(
-                "cin", cin,
-                "rawResults", raw,
-                "report", transformed,
-                "fetchedAt", OffsetDateTime.now().toString()
-        );
-    } catch (Exception e) {
-        return Map.of("error", "Failed to fetch data: " + e.getMessage());
     }
-}
 
-public Map<String, Object> getData(String cin) {
-    try {
-        JsonNode raw = probe42IntegrationService.fetchComprehensive(cin);
+    public Map<String, Object> getData(String cin) {
+        try {
+            JsonNode raw = probe42IntegrationService.fetchComprehensive(cin);
+            if (raw == null || raw.isNull()) {
+                return Map.of("error", "No data found for CIN: " + cin);
+            }
 
-        if (raw == null || raw.isNull()) {
-            return Map.of("error", "No data found for CIN: " + cin);
+            return Map.of(
+                    "cin", cin,
+                    "snapshotData", raw
+            );
+        } catch (Exception e) {
+            return Map.of("error", "Failed to retrieve data: " + e.getMessage());
         }
-
-        Map<String, Object> transformed = reportDataService.transformToReport(
-                raw,
-                extractCompanyName(raw, cin),
-                cin
-        );
-
-        return Map.of(
-                "cin", cin,
-                "rawResults", raw,
-                "report", transformed
-        );
-    } catch (Exception e) {
-        return Map.of("error", "Failed to retrieve data: " + e.getMessage());
     }
-}
 
 public Map<String, Object> refreshData(String cin) {
     return fetchAndStore(cin);
@@ -244,10 +207,7 @@ public boolean exists(String cin) {
 
         try {
             if (s.getRawJson() != null) {
-                m.put("rawResults", objectMapper.readValue(s.getRawJson(), Object.class));
-            }
-            if (s.getTransformedJson() != null) {
-                m.put("report", objectMapper.readValue(s.getTransformedJson(), Object.class));
+                m.put("snapshotData", objectMapper.readValue(s.getRawJson(), Object.class));
             }
         } catch (Exception ignored) {
         }
@@ -263,17 +223,6 @@ public boolean exists(String cin) {
         m.put("companyName", s.getCompanyName());
         m.put("fetchedAt", s.getFetchedAt() != null ? s.getFetchedAt().toString() : null);
         m.put("fetchedBy", s.getFetchedBy());
-        return m;
-    }
-
-    private Map<String, Object> snapshotVersionToMap(RawComprehensiveData s) {
-        Map<String, Object> m = snapshotSummaryToMap(s);
-        try {
-            if (s.getTransformedJson() != null) {
-                m.put("report", objectMapper.readValue(s.getTransformedJson(), Object.class));
-            }
-        } catch (Exception ignored) {
-        }
         return m;
     }
 

@@ -19,9 +19,6 @@ public class ProviderSearchSnapshot {
     @Column(columnDefinition = "TEXT", nullable = false)
     private String rawResultsJson; // full Probe42 response
 
-    @Column(columnDefinition = "TEXT")
-    private String transformedReportJson; // transformed report for frontend
-
     private OffsetDateTime fetchedAt;
 
     @PrePersist

@@ -31,6 +31,7 @@ public class OperationsOrderController {
     private final OrderRepository orderRepository;
     private final ClientCompanyRepository clientCompanyRepository;
     private final ProviderSearchSnapshotRepository snapshotRepository;
+    private final RawComprehensiveDataRepository rawRepository;
     private final AnalystEnrichmentRepository enrichmentRepository;
     private final GeneratedDocumentRepository documentRepository;
     private final Probe42Client probe42Client;
@@ -43,6 +44,7 @@ public OperationsOrderController(
         OrderRepository orderRepository,
         ClientCompanyRepository clientCompanyRepository,
         ProviderSearchSnapshotRepository snapshotRepository,
+        RawComprehensiveDataRepository rawRepository,
         AnalystEnrichmentRepository enrichmentRepository,
         GeneratedDocumentRepository documentRepository,
         Probe42Client probe42Client,
@@ -55,6 +57,7 @@ public OperationsOrderController(
     this.orderRepository = orderRepository;
     this.clientCompanyRepository = clientCompanyRepository;
     this.snapshotRepository = snapshotRepository;
+    this.rawRepository = rawRepository;
     this.enrichmentRepository = enrichmentRepository;
     this.documentRepository = documentRepository;
     this.probe42Client = probe42Client;
@@ -122,41 +125,14 @@ public OperationsOrderController(
         // Attach provider search snapshot
         snapshotRepository.findByOrderId(id).ifPresent(snap -> {
             try {
-                Map<String, Object> transformed =
-                        objectMapper.readValue(
-                                snap.getTransformedReportJson(),
-                                new TypeReference<Map<String, Object>>() {}
-                        );
-
-                Map<String, Object> snapshotData = new LinkedHashMap<>();
-
-                // exact frontend-friendly shape
-                Object versionInfo = transformed.get("versionInfo");
-                if (versionInfo == null) {
-                    versionInfo = Map.of(
-                            "version", 1,
-                            "provider", "PROBE42",
-                            "fetchedAt", OffsetDateTime.now().toString(),
-                            "fetchedBy", "operations"
-                    );
-                }
-
-                snapshotData.put("versionInfo", versionInfo);
-                snapshotData.put("metadata", transformed.get("metadata"));
-
-                Object data = transformed.get("data");
-                if (data == null) {
-                    Map<String, Object> fallback = new LinkedHashMap<>(transformed);
-                    fallback.remove("metadata");
-                    fallback.remove("versionInfo");
-                    data = fallback;
-                }
-
-                snapshotData.put("data", data);
-                result.put("providerSearchSnapshot", snapshotData);
-
+                result.put(
+                    "snapshotData",
+                    snap.getRawResultsJson() != null
+                        ? objectMapper.readValue(snap.getRawResultsJson(), Object.class)
+                        : null
+                );
             } catch (Exception e) {
-                log.warn("Failed to parse snapshot for order {}", id, e);
+                log.warn("Failed to parse raw snapshot for order {}", id, e);
             }
         });
 
@@ -195,6 +171,24 @@ public OperationsOrderController(
         return ResponseEntity.ok(result);
     }
 
+    // ── GET /api/operations/orders/{id}/versions/{version} ──
+    @GetMapping("/orders/{id}/versions/{version}")
+    public ResponseEntity<Map<String, Object>> getVersion(@PathVariable Long id, @PathVariable Integer version) {
+        RawComprehensiveData snapshot = rawRepository.findByOrder_IdOrderByVersionDesc(id).stream()
+                .filter(s -> version.equals(s.getVersion()))
+                .findFirst()
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Version not found"));
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        try {
+            result.put("latestSnapshot", snapshotSummaryToMap(snapshot));
+            result.put("snapshotData", objectMapper.readValue(snapshot.getRawJson(), Object.class));
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to parse version data");
+        }
+        return ResponseEntity.ok(result);
+    }
+
     // ── POST /api/operations/orders/{id}/fetch-data ──
 @PostMapping("/orders/{id}/fetch-data")
 public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
@@ -222,9 +216,10 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
 
     Map<String, Object> response = new LinkedHashMap<>();
     response.put("status", "data_fetched");
-    response.put("latest", saved);
     response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
     response.put("versions", comprehensiveDataService.getVersions(id));
+    response.put("snapshotData", saved.get("snapshotData"));
+    response.put("latest", saved);
 
     return ResponseEntity.ok(response);
 }
@@ -277,10 +272,10 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        // Get the transformed report data
+        // Get the raw data
         Map<String, Object> latest = comprehensiveDataService.getLatest(id);
 
-        if (latest == null || latest.get("report") == null) {
+        if (latest == null || latest.get("snapshotData") == null) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
                     "No company data fetched yet. Please fetch data first."
@@ -288,8 +283,13 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         }
 
         @SuppressWarnings("unchecked")
-        Map<String, Object> reportData =
-        (Map<String, Object>) latest.get("report");
+        Map<String, Object> rawPayload = (Map<String, Object>) latest.get("snapshotData");
+        JsonNode rawNode = objectMapper.valueToTree(rawPayload);
+        Map<String, Object> reportData = reportDataService.transformToReport(
+                rawNode,
+                order.getSubjectName(),
+                comprehensiveDataService.resolveIdentifier(order)
+        );
 
         // Run decision engine
         Map<String, Object> decisionOutputs = decisionEngineService.execute(reportData);
@@ -322,18 +322,23 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         // Get report data
-       Map<String, Object> latest = comprehensiveDataService.getLatest(id);
+        Map<String, Object> latest = comprehensiveDataService.getLatest(id);
 
-if (latest == null || latest.get("report") == null) {
-    throw new ResponseStatusException(
-            HttpStatus.BAD_REQUEST,
-            "No company data fetched yet. Please fetch data first."
-    );
-}
+        if (latest == null || latest.get("snapshotData") == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "No company data fetched yet. Please fetch data first."
+            );
+        }
 
-@SuppressWarnings("unchecked")
-Map<String, Object> reportData =
-        (Map<String, Object>) latest.get("report");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> rawPayload = (Map<String, Object>) latest.get("snapshotData");
+        JsonNode rawNode = objectMapper.valueToTree(rawPayload);
+        Map<String, Object> reportData = reportDataService.transformToReport(
+                rawNode,
+                order.getSubjectName(),
+                comprehensiveDataService.resolveIdentifier(order)
+        );
 
         // Get enrichment
         AnalystEnrichment enrichment = enrichmentRepository.findByOrderId(id).orElse(null);
@@ -510,5 +515,25 @@ Map<String, Object> reportData =
 
     private String strVal(Object o) {
         return o != null ? String.valueOf(o) : "";
+    }
+
+    private Map<String, Object> snapshotSummaryToMap(RawComprehensiveData s) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", s.getId());
+        m.put("version", s.getVersion());
+        m.put("provider", s.getProvider());
+        m.put("cin", s.getCin());
+        m.put("companyName", s.getCompanyName());
+        m.put("fetchedAt", s.getFetchedAt() != null ? s.getFetchedAt().toString() : null);
+        m.put("fetchedBy", s.getFetchedBy());
+        return m;
+    }
+
+    private JsonNode getLatestRawNode(Long orderId) {
+        Map<String, Object> latest = comprehensiveDataService.getLatest(orderId);
+        if (latest == null || latest.get("snapshotData") == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No snapshot data");
+        }
+        return objectMapper.valueToTree(latest.get("snapshotData"));
     }
 }

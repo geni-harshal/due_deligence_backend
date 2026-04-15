@@ -184,7 +184,7 @@ public class ClientOrderController {
             response.put("autoFetchMessage", "Order is processed and data is fetched successfully.");
             response.put("latestSnapshot", comprehensiveDataService.getLatest(saved.getId()));
             response.put("versions", comprehensiveDataService.getVersions(saved.getId()));
-            response.put("fetchedSummary", fetched);
+            response.put("snapshotData", fetched.get("snapshotData"));
         } catch (RuntimeException ex) {
             response.put("autoFetchStatus", "failed");
             response.put(
