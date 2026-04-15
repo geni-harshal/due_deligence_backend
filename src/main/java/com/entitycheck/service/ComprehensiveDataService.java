@@ -41,7 +41,7 @@ public class ComprehensiveDataService {
 
     @Transactional
     public Map<String, Object> fetchAndStoreFresh(Order order, String identifier, String fetchedBy) {
-        String effectiveIdentifier = identifier;
+        String effectiveIdentifier = normalizeIdentifier(identifier);
         JsonNode raw = probe42IntegrationService.fetchComprehensive(effectiveIdentifier);
 
         if ((raw == null || raw.isNull()) && order != null && order.getSubjectName() != null && !order.getSubjectName().isBlank()) {
@@ -132,9 +132,40 @@ public class ComprehensiveDataService {
         List<RawComprehensiveData> versions = rawRepository.findByOrder_IdOrderByVersionDesc(orderId);
         List<Map<String, Object>> out = new ArrayList<>();
         for (RawComprehensiveData s : versions) {
-            out.add(snapshotSummaryToMap(s));
+            out.add(snapshotVersionToMap(s));
         }
         return out;
+    }
+
+    public String resolveIdentifier(Order order) {
+        if (order == null) return "";
+
+        if (order.getSubjectDetails() != null && !order.getSubjectDetails().isBlank()) {
+            try {
+                Map<String, Object> details = objectMapper.readValue(
+                        order.getSubjectDetails(),
+                        new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}
+                );
+
+                String cin = normalizeIdentifier(strVal(details.get("cin")));
+                if (!cin.isBlank()) return cin;
+
+                String identifier = normalizeIdentifier(strVal(details.get("identifier")));
+                if (!identifier.isBlank()) return identifier;
+
+                String pan = normalizeIdentifier(strVal(details.get("pan")));
+                if (!pan.isBlank()) return pan;
+
+                String llpin = normalizeIdentifier(strVal(details.get("llpin")));
+                if (!llpin.isBlank()) return llpin;
+
+                String bid = normalizeIdentifier(strVal(details.get("bid")));
+                if (!bid.isBlank()) return bid;
+            } catch (Exception ignored) {
+            }
+        }
+
+        return normalizeIdentifier(order.getSubjectName());
     }
 
     public Map<String, Object> fetchAndStore(String cin) {
@@ -233,6 +264,26 @@ public boolean exists(String cin) {
         m.put("fetchedAt", s.getFetchedAt() != null ? s.getFetchedAt().toString() : null);
         m.put("fetchedBy", s.getFetchedBy());
         return m;
+    }
+
+    private Map<String, Object> snapshotVersionToMap(RawComprehensiveData s) {
+        Map<String, Object> m = snapshotSummaryToMap(s);
+        try {
+            if (s.getTransformedJson() != null) {
+                m.put("report", objectMapper.readValue(s.getTransformedJson(), Object.class));
+            }
+        } catch (Exception ignored) {
+        }
+        return m;
+    }
+
+    private String strVal(Object o) {
+        return o != null ? String.valueOf(o) : "";
+    }
+
+    private String normalizeIdentifier(String value) {
+        if (value == null) return "";
+        return value.trim().toUpperCase();
     }
 
     private String extractCompanyName(JsonNode raw, String fallback) {

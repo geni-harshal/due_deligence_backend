@@ -2,6 +2,7 @@ package com.entitycheck.controller;
 
 import com.entitycheck.model.*;
 import com.entitycheck.repository.*;
+import com.entitycheck.service.ComprehensiveDataService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.http.*;
@@ -25,19 +26,22 @@ public class ClientOrderController {
     private final ClientProductRepository clientProductRepository;
     private final GeneratedDocumentRepository generatedDocumentRepository;
     private final ObjectMapper objectMapper;
+    private final ComprehensiveDataService comprehensiveDataService;
 
     public ClientOrderController(UserRepository userRepository,
                                   OrderRepository orderRepository,
                                   ProductRepository productRepository,
                                   ClientProductRepository clientProductRepository,
                                   GeneratedDocumentRepository generatedDocumentRepository,
-                                  ObjectMapper objectMapper) {
+                                  ObjectMapper objectMapper,
+                                  ComprehensiveDataService comprehensiveDataService) {
         this.userRepository = userRepository;
         this.orderRepository = orderRepository;
         this.productRepository = productRepository;
         this.clientProductRepository = clientProductRepository;
         this.generatedDocumentRepository = generatedDocumentRepository;
         this.objectMapper = objectMapper;
+        this.comprehensiveDataService = comprehensiveDataService;
     }
 
     // ── GET /api/client/entitlements ──
@@ -165,9 +169,32 @@ public class ClientOrderController {
 
         // Advance to pending_data_fetch
         saved.setStatus(OrderStatus.PENDING_DATA_FETCH);
-        orderRepository.save(saved);
+        saved = orderRepository.save(saved);
 
-        return ResponseEntity.ok(orderToMap(saved));
+        Map<String, Object> response = new LinkedHashMap<>(orderToMap(saved));
+        String identifier = comprehensiveDataService.resolveIdentifier(saved);
+        try {
+            Map<String, Object> fetched = comprehensiveDataService.fetchAndStoreFresh(saved, identifier, "client_auto");
+            saved.setStatus(OrderStatus.DATA_FETCHED);
+            saved = orderRepository.save(saved);
+
+            response.clear();
+            response.putAll(orderToMap(saved));
+            response.put("autoFetchStatus", "success");
+            response.put("autoFetchMessage", "Order is processed and data is fetched successfully.");
+            response.put("latestSnapshot", comprehensiveDataService.getLatest(saved.getId()));
+            response.put("versions", comprehensiveDataService.getVersions(saved.getId()));
+            response.put("fetchedSummary", fetched);
+        } catch (RuntimeException ex) {
+            response.put("autoFetchStatus", "failed");
+            response.put(
+                    "autoFetchMessage",
+                    "Order was placed successfully, but automatic data fetch failed. Operations can use re-fetch."
+            );
+            response.put("autoFetchError", ex.getMessage());
+        }
+
+        return ResponseEntity.ok(response);
     }
 
     // ── GET /api/client/orders/{id}/download-pdf ──

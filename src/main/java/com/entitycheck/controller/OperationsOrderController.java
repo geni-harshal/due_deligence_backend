@@ -116,6 +116,8 @@ public OperationsOrderController(
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         Map<String, Object> result = orderToMap(order);
+        result.put("latestSnapshot", comprehensiveDataService.getLatest(id));
+        result.put("versions", comprehensiveDataService.getVersions(id));
 
         // Attach provider search snapshot
         snapshotRepository.findByOrderId(id).ifPresent(snap -> {
@@ -199,7 +201,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
     Order order = orderRepository.findByIdWithDetails(id)
             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-    String identifier = extractCin(order);
+    String identifier = comprehensiveDataService.resolveIdentifier(order);
     if (identifier == null || identifier.isBlank()) {
         throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
     }
@@ -466,31 +468,6 @@ Map<String, Object> reportData =
     }
 
     // ── Helpers ──
-
-    private String extractCin(Order order) {
-        if (order.getSubjectDetails() != null) {
-            try {
-                Map<String, Object> details = objectMapper.readValue(order.getSubjectDetails(),
-                        new TypeReference<Map<String, Object>>() {});
-                String cin = strVal(details.get("cin"));
-                if (!cin.isBlank()) return cin;
-
-                String identifier = strVal(details.get("identifier"));
-                if (!identifier.isBlank()) return identifier;
-
-                String pan = strVal(details.get("pan"));
-                if (!pan.isBlank()) return pan;
-
-                String llpin = strVal(details.get("llpin"));
-                if (!llpin.isBlank()) return llpin;
-
-                String bid = strVal(details.get("bid"));
-                if (!bid.isBlank()) return bid;
-            } catch (Exception ignored) {}
-        }
-        // Fallback to subject name as identifier
-        return order.getSubjectName() != null ? order.getSubjectName() : "";
-    }
 
     private Map<String, Object> orderToMap(Order o) {
         Map<String, Object> m = new LinkedHashMap<>();
