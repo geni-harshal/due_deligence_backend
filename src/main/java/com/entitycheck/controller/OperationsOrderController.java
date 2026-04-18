@@ -16,6 +16,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 import com.entitycheck.service.ComprehensiveDataService;
+import com.entitycheck.service.CreditReportService;
 
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
@@ -24,8 +25,6 @@ import java.util.*;
 @RestController
 @RequestMapping("/api/operations")
 public class OperationsOrderController {
-    private final ComprehensiveDataService comprehensiveDataService;
-
     private static final Logger log = LoggerFactory.getLogger(OperationsOrderController.class);
 
     private final OrderRepository orderRepository;
@@ -39,34 +38,42 @@ public class OperationsOrderController {
     private final DecisionEngineService decisionEngineService;
     private final OrderPdfService orderPdfService;
     private final ObjectMapper objectMapper;
+    private final ComprehensiveDataService comprehensiveDataService;
+    private final CreditReportService creditReportService;   // ← Only once here
+
+    public OperationsOrderController(
+            OrderRepository orderRepository,
+            ClientCompanyRepository clientCompanyRepository,
+            ProviderSearchSnapshotRepository snapshotRepository,
+            RawComprehensiveDataRepository rawRepository,
+            AnalystEnrichmentRepository enrichmentRepository,
+            GeneratedDocumentRepository documentRepository,
+            Probe42Client probe42Client,
+            ReportDataService reportDataService,
+            DecisionEngineService decisionEngineService,
+            OrderPdfService orderPdfService,
+            ObjectMapper objectMapper,
+            ComprehensiveDataService comprehensiveDataService,
+            CreditReportService creditReportService) {       // ← Parameter present
+
+        this.orderRepository = orderRepository;
+        this.clientCompanyRepository = clientCompanyRepository;
+        this.snapshotRepository = snapshotRepository;
+        this.rawRepository = rawRepository;
+        this.enrichmentRepository = enrichmentRepository;
+        this.documentRepository = documentRepository;
+        this.probe42Client = probe42Client;
+        this.reportDataService = reportDataService;
+        this.decisionEngineService = decisionEngineService;
+        this.orderPdfService = orderPdfService;
+        this.objectMapper = objectMapper;
+        this.comprehensiveDataService = comprehensiveDataService;
+        this.creditReportService = creditReportService;      // ← Must assign
+    }
+
     
-public OperationsOrderController(
-        OrderRepository orderRepository,
-        ClientCompanyRepository clientCompanyRepository,
-        ProviderSearchSnapshotRepository snapshotRepository,
-        RawComprehensiveDataRepository rawRepository,
-        AnalystEnrichmentRepository enrichmentRepository,
-        GeneratedDocumentRepository documentRepository,
-        Probe42Client probe42Client,
-        ReportDataService reportDataService,
-        DecisionEngineService decisionEngineService,
-        OrderPdfService orderPdfService,
-        ObjectMapper objectMapper,
-        ComprehensiveDataService comprehensiveDataService
-) {
-    this.orderRepository = orderRepository;
-    this.clientCompanyRepository = clientCompanyRepository;
-    this.snapshotRepository = snapshotRepository;
-    this.rawRepository = rawRepository;
-    this.enrichmentRepository = enrichmentRepository;
-    this.documentRepository = documentRepository;
-    this.probe42Client = probe42Client;
-    this.reportDataService = reportDataService;
-    this.decisionEngineService = decisionEngineService;
-    this.orderPdfService = orderPdfService;
-    this.objectMapper = objectMapper;
-    this.comprehensiveDataService = comprehensiveDataService;
-}
+
+
     // ── GET /api/operations/orders ──
     @GetMapping("/orders")
     public ResponseEntity<List<Map<String, Object>>> listOrders(
@@ -126,11 +133,10 @@ public OperationsOrderController(
         snapshotRepository.findByOrderId(id).ifPresent(snap -> {
             try {
                 result.put(
-                    "snapshotData",
-                    snap.getRawResultsJson() != null
-                        ? objectMapper.readValue(snap.getRawResultsJson(), Object.class)
-                        : null
-                );
+                        "snapshotData",
+                        snap.getRawResultsJson() != null
+                                ? objectMapper.readValue(snap.getRawResultsJson(), Object.class)
+                                : null);
             } catch (Exception e) {
                 log.warn("Failed to parse raw snapshot for order {}", id, e);
             }
@@ -147,7 +153,8 @@ public OperationsOrderController(
             if (enrich.getDecisionOutputsJson() != null) {
                 try {
                     enrichData.put("decisionOutputs", objectMapper.readValue(
-                            enrich.getDecisionOutputsJson(), new TypeReference<Map<String, Object>>() {}));
+                            enrich.getDecisionOutputsJson(), new TypeReference<Map<String, Object>>() {
+                            }));
                 } catch (Exception e) {
                     log.warn("Failed to parse decision outputs for order {}", id, e);
                 }
@@ -190,43 +197,71 @@ public OperationsOrderController(
     }
 
     // ── POST /api/operations/orders/{id}/fetch-data ──
-@PostMapping("/orders/{id}/fetch-data")
-public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
-    Order order = orderRepository.findByIdWithDetails(id)
-            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+    @PostMapping("/orders/{id}/fetch-data")
+    public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-    String identifier = comprehensiveDataService.resolveIdentifier(order);
-    if (identifier == null || identifier.isBlank()) {
-        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
+        String identifier = comprehensiveDataService.resolveIdentifier(order);
+        if (identifier == null || identifier.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
+        }
+
+        Map<String, Object> saved;
+        try {
+            saved = comprehensiveDataService.fetchAndStoreFresh(
+                    order,
+                    identifier,
+                    "operations");
+        } catch (RuntimeException ex) {
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, ex.getMessage());
+        }
+
+        order.setStatus(OrderStatus.DATA_FETCHED);
+        orderRepository.save(order);
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", "data_fetched");
+        response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
+        response.put("versions", comprehensiveDataService.getVersions(id));
+        response.put("snapshotData", saved.get("snapshotData"));
+        response.put("latest", saved);
+
+        return ResponseEntity.ok(response);
     }
 
-    Map<String, Object> saved;
+    
+
+    // constructor: add creditReportService
+
+@PostMapping("/orders/{id}/generate-credit-report")
+public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Long id) {
     try {
-        saved = comprehensiveDataService.fetchAndStoreFresh(
-                order,
-                identifier,
-                "operations"
-        );
-    } catch (RuntimeException ex) {
-        throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, ex.getMessage());
+        creditReportService.generateCreditReport(id);  // void, async
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", "accepted");
+        response.put("message", "Credit report generation started");
+        response.put("orderId", id);
+        return ResponseEntity.accepted().body(response);
+    } catch (RuntimeException e) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", e.getMessage()));
+    }
+}
+
+    @GetMapping("/orders/{id}/credit-report")
+    public ResponseEntity<Map<String, Object>> getCreditReport(@PathVariable Long id) {
+        Map<String, Object> report = creditReportService.getLatestCreditReport(id);
+        if (report == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(report);
     }
 
-    order.setStatus(OrderStatus.DATA_FETCHED);
-    orderRepository.save(order);
-
-    Map<String, Object> response = new LinkedHashMap<>();
-    response.put("status", "data_fetched");
-    response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
-    response.put("versions", comprehensiveDataService.getVersions(id));
-    response.put("snapshotData", saved.get("snapshotData"));
-    response.put("latest", saved);
-
-    return ResponseEntity.ok(response);
-}
     // ── PUT /api/operations/orders/{id}/enrichment ──
     @PutMapping("/orders/{id}/enrichment")
     public ResponseEntity<Map<String, Object>> saveEnrichment(@PathVariable Long id,
-                                                               @RequestBody Map<String, Object> body) {
+            @RequestBody Map<String, Object> body) {
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
@@ -278,8 +313,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         if (latest == null || latest.get("snapshotData") == null) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "No company data fetched yet. Please fetch data first."
-            );
+                    "No company data fetched yet. Please fetch data first.");
         }
 
         @SuppressWarnings("unchecked")
@@ -288,8 +322,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         Map<String, Object> reportData = reportDataService.transformToReport(
                 rawNode,
                 order.getSubjectName(),
-                comprehensiveDataService.resolveIdentifier(order)
-        );
+                comprehensiveDataService.resolveIdentifier(order));
 
         // Run decision engine
         Map<String, Object> decisionOutputs = decisionEngineService.execute(reportData);
@@ -327,8 +360,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         if (latest == null || latest.get("snapshotData") == null) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "No company data fetched yet. Please fetch data first."
-            );
+                    "No company data fetched yet. Please fetch data first.");
         }
 
         @SuppressWarnings("unchecked")
@@ -337,8 +369,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         Map<String, Object> reportData = reportDataService.transformToReport(
                 rawNode,
                 order.getSubjectName(),
-                comprehensiveDataService.resolveIdentifier(order)
-        );
+                comprehensiveDataService.resolveIdentifier(order));
 
         // Get enrichment
         AnalystEnrichment enrichment = enrichmentRepository.findByOrderId(id).orElse(null);
@@ -353,7 +384,8 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
             if (enrichment.getDecisionOutputsJson() != null) {
                 try {
                     decisionOutputs = objectMapper.readValue(enrichment.getDecisionOutputsJson(),
-                            new TypeReference<Map<String, Object>>() {});
+                            new TypeReference<Map<String, Object>>() {
+                            });
                 } catch (Exception e) {
                     log.warn("Failed to parse decision outputs for PDF generation", e);
                 }
@@ -366,8 +398,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
                 order.getSubjectName(),
                 reportData,
                 enrichmentMap,
-                decisionOutputs
-        );
+                decisionOutputs);
 
         String pdfBase64 = Base64.getEncoder().encodeToString(pdfBytes);
         String fileName = "DDR-" + order.getOrderNumber() + ".pdf";
@@ -392,8 +423,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         return ResponseEntity.ok(Map.of(
                 "status", "ready",
                 "fileName", fileName,
-                "documentId", doc.getId()
-        ));
+                "documentId", doc.getId()));
     }
 
     // ── POST /api/operations/orders/{id}/publish ──
@@ -431,8 +461,7 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         return ResponseEntity.ok(Map.of(
                 "status", "completed",
                 "message", "Report published and client notified",
-                "completedAt", order.getCompletedAt().toString()
-        ));
+                "completedAt", order.getCompletedAt().toString()));
     }
 
     // ── GET /api/operations/client-companies ──
@@ -454,22 +483,19 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getStats() {
         List<Order> all = orderRepository.findAll();
-        long pending = all.stream().filter(o ->
-                o.getStatus() == OrderStatus.ORDER_PLACED ||
-                        o.getStatus() == OrderStatus.PENDING_DATA_FETCH ||
-                        o.getStatus() == OrderStatus.DATA_FETCHED).count();
-        long inProgress = all.stream().filter(o ->
-                o.getStatus() == OrderStatus.IN_PROGRESS ||
-                        o.getStatus() == OrderStatus.MODEL_EXECUTED ||
-                        o.getStatus() == OrderStatus.PDF_GENERATED).count();
+        long pending = all.stream().filter(o -> o.getStatus() == OrderStatus.ORDER_PLACED ||
+                o.getStatus() == OrderStatus.PENDING_DATA_FETCH ||
+                o.getStatus() == OrderStatus.DATA_FETCHED).count();
+        long inProgress = all.stream().filter(o -> o.getStatus() == OrderStatus.IN_PROGRESS ||
+                o.getStatus() == OrderStatus.MODEL_EXECUTED ||
+                o.getStatus() == OrderStatus.PDF_GENERATED).count();
         long completed = all.stream().filter(o -> o.getStatus() == OrderStatus.COMPLETED).count();
 
         return ResponseEntity.ok(Map.of(
                 "pendingOrders", pending,
                 "inProgressOrders", inProgress,
                 "completedToday", completed, // simplified
-                "avgCompletionHours", 24
-        ));
+                "avgCompletionHours", 24));
     }
 
     // ── Helpers ──
@@ -496,18 +522,22 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
     }
 
     private Object parseJson(String json) {
-        if (json == null || json.isBlank()) return null;
+        if (json == null || json.isBlank())
+            return null;
         try {
-            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {
+            });
         } catch (Exception e) {
             return json;
         }
     }
 
     private List<String> parseJsonList(String json) {
-        if (json == null || json.isBlank()) return List.of();
+        if (json == null || json.isBlank())
+            return List.of();
         try {
-            return objectMapper.readValue(json, new TypeReference<List<String>>() {});
+            return objectMapper.readValue(json, new TypeReference<List<String>>() {
+            });
         } catch (Exception e) {
             return List.of();
         }
