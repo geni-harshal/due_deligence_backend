@@ -21,6 +21,7 @@ import com.entitycheck.service.CreditReportService;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/operations")
@@ -39,7 +40,7 @@ public class OperationsOrderController {
     private final OrderPdfService orderPdfService;
     private final ObjectMapper objectMapper;
     private final ComprehensiveDataService comprehensiveDataService;
-    private final CreditReportService creditReportService;   // ← Only once here
+    private final CreditReportService creditReportService; // ← Only once here
 
     public OperationsOrderController(
             OrderRepository orderRepository,
@@ -54,7 +55,7 @@ public class OperationsOrderController {
             OrderPdfService orderPdfService,
             ObjectMapper objectMapper,
             ComprehensiveDataService comprehensiveDataService,
-            CreditReportService creditReportService) {       // ← Parameter present
+            CreditReportService creditReportService) { // ← Parameter present
 
         this.orderRepository = orderRepository;
         this.clientCompanyRepository = clientCompanyRepository;
@@ -68,11 +69,8 @@ public class OperationsOrderController {
         this.orderPdfService = orderPdfService;
         this.objectMapper = objectMapper;
         this.comprehensiveDataService = comprehensiveDataService;
-        this.creditReportService = creditReportService;      // ← Must assign
+        this.creditReportService = creditReportService; // ← Must assign
     }
-
-    
-
 
     // ── GET /api/operations/orders ──
     @GetMapping("/orders")
@@ -126,7 +124,7 @@ public class OperationsOrderController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         Map<String, Object> result = orderToMap(order);
-        result.put("latestSnapshot", comprehensiveDataService.getLatest(id));
+        // result.put("latestSnapshot", comprehensiveDataService.getLatest(id));
         result.put("versions", comprehensiveDataService.getVersions(id));
 
         // Attach provider search snapshot
@@ -181,18 +179,33 @@ public class OperationsOrderController {
     // ── GET /api/operations/orders/{id}/versions/{version} ──
     @GetMapping("/orders/{id}/versions/{version}")
     public ResponseEntity<Map<String, Object>> getVersion(@PathVariable Long id, @PathVariable Integer version) {
+        // 1. Fetch the order with all details
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+
+        // 2. Fetch the specific version snapshot
         RawComprehensiveData snapshot = rawRepository.findByOrder_IdOrderByVersionDesc(id).stream()
                 .filter(s -> version.equals(s.getVersion()))
                 .findFirst()
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Version not found"));
 
-        Map<String, Object> result = new LinkedHashMap<>();
+        // 3. Build response: start with the full order map (includes versions list,
+        // etc.)
+        Map<String, Object> result = orderToMap(order);
+
+        // 4. Add version-specific fields (override if any conflict, but orderToMap
+        // doesn't have these)
+        result.put("version", snapshot.getVersion());
+        result.put("fetchedAt", snapshot.getFetchedAt().toString());
+        result.put("fetchedBy", snapshot.getFetchedBy());
+
+        // 5. Add the snapshot data
         try {
-            result.put("latestSnapshot", snapshotSummaryToMap(snapshot));
             result.put("snapshotData", objectMapper.readValue(snapshot.getRawJson(), Object.class));
         } catch (Exception e) {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to parse version data");
         }
+
         return ResponseEntity.ok(result);
     }
 
@@ -230,24 +243,22 @@ public class OperationsOrderController {
         return ResponseEntity.ok(response);
     }
 
-    
-
     // constructor: add creditReportService
 
-@PostMapping("/orders/{id}/generate-credit-report")
-public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Long id) {
-    try {
-        creditReportService.generateCreditReport(id);  // void, async
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("status", "accepted");
-        response.put("message", "Credit report generation started");
-        response.put("orderId", id);
-        return ResponseEntity.accepted().body(response);
-    } catch (RuntimeException e) {
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(Map.of("error", e.getMessage()));
+    @PostMapping("/orders/{id}/generate-credit-report")
+    public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Long id) {
+        try {
+            creditReportService.generateCreditReport(id); // void, async
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("status", "accepted");
+            response.put("message", "Credit report generation started");
+            response.put("orderId", id);
+            return ResponseEntity.accepted().body(response);
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", e.getMessage()));
+        }
     }
-}
 
     @GetMapping("/orders/{id}/credit-report")
     public ResponseEntity<Map<String, Object>> getCreditReport(@PathVariable Long id) {
@@ -518,6 +529,26 @@ public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Lo
         m.put("createdAt", o.getCreatedAt() != null ? o.getCreatedAt().toString() : null);
         m.put("updatedAt", o.getUpdatedAt() != null ? o.getUpdatedAt().toString() : null);
         m.put("completedAt", o.getCompletedAt() != null ? o.getCompletedAt().toString() : null);
+
+        // Include versions summary (without snapshotData)
+        List<Map<String, Object>> versions = rawRepository.findByOrder_IdOrderByVersionDesc(o.getId())
+                .stream()
+                .map(this::snapshotSummaryToMap)
+                .collect(Collectors.toList());
+        m.put("versions", versions);
+
+        // Include generated documents summary
+        List<GeneratedDocument> docs = documentRepository.findByOrderId(o.getId());
+        List<Map<String, Object>> docList = docs.stream().map(d -> {
+            Map<String, Object> dm = new LinkedHashMap<>();
+            dm.put("id", d.getId());
+            dm.put("documentType", d.getDocumentType());
+            dm.put("status", d.getStatus());
+            dm.put("fileName", d.getFileName());
+            return dm;
+        }).toList();
+        m.put("generatedDocuments", docList);
+
         return m;
     }
 
