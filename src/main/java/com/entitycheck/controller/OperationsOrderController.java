@@ -16,21 +16,22 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 import com.entitycheck.service.ComprehensiveDataService;
+import com.entitycheck.service.CreditReportService;
 
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/operations")
 public class OperationsOrderController {
-    private final ComprehensiveDataService comprehensiveDataService;
-
     private static final Logger log = LoggerFactory.getLogger(OperationsOrderController.class);
 
     private final OrderRepository orderRepository;
     private final ClientCompanyRepository clientCompanyRepository;
     private final ProviderSearchSnapshotRepository snapshotRepository;
+    private final RawComprehensiveDataRepository rawRepository;
     private final AnalystEnrichmentRepository enrichmentRepository;
     private final GeneratedDocumentRepository documentRepository;
     private final Probe42Client probe42Client;
@@ -38,32 +39,39 @@ public class OperationsOrderController {
     private final DecisionEngineService decisionEngineService;
     private final OrderPdfService orderPdfService;
     private final ObjectMapper objectMapper;
-    
-public OperationsOrderController(
-        OrderRepository orderRepository,
-        ClientCompanyRepository clientCompanyRepository,
-        ProviderSearchSnapshotRepository snapshotRepository,
-        AnalystEnrichmentRepository enrichmentRepository,
-        GeneratedDocumentRepository documentRepository,
-        Probe42Client probe42Client,
-        ReportDataService reportDataService,
-        DecisionEngineService decisionEngineService,
-        OrderPdfService orderPdfService,
-        ObjectMapper objectMapper,
-        ComprehensiveDataService comprehensiveDataService
-) {
-    this.orderRepository = orderRepository;
-    this.clientCompanyRepository = clientCompanyRepository;
-    this.snapshotRepository = snapshotRepository;
-    this.enrichmentRepository = enrichmentRepository;
-    this.documentRepository = documentRepository;
-    this.probe42Client = probe42Client;
-    this.reportDataService = reportDataService;
-    this.decisionEngineService = decisionEngineService;
-    this.orderPdfService = orderPdfService;
-    this.objectMapper = objectMapper;
-    this.comprehensiveDataService = comprehensiveDataService;
-}
+    private final ComprehensiveDataService comprehensiveDataService;
+    private final CreditReportService creditReportService; // ← Only once here
+
+    public OperationsOrderController(
+            OrderRepository orderRepository,
+            ClientCompanyRepository clientCompanyRepository,
+            ProviderSearchSnapshotRepository snapshotRepository,
+            RawComprehensiveDataRepository rawRepository,
+            AnalystEnrichmentRepository enrichmentRepository,
+            GeneratedDocumentRepository documentRepository,
+            Probe42Client probe42Client,
+            ReportDataService reportDataService,
+            DecisionEngineService decisionEngineService,
+            OrderPdfService orderPdfService,
+            ObjectMapper objectMapper,
+            ComprehensiveDataService comprehensiveDataService,
+            CreditReportService creditReportService) { // ← Parameter present
+
+        this.orderRepository = orderRepository;
+        this.clientCompanyRepository = clientCompanyRepository;
+        this.snapshotRepository = snapshotRepository;
+        this.rawRepository = rawRepository;
+        this.enrichmentRepository = enrichmentRepository;
+        this.documentRepository = documentRepository;
+        this.probe42Client = probe42Client;
+        this.reportDataService = reportDataService;
+        this.decisionEngineService = decisionEngineService;
+        this.orderPdfService = orderPdfService;
+        this.objectMapper = objectMapper;
+        this.comprehensiveDataService = comprehensiveDataService;
+        this.creditReportService = creditReportService; // ← Must assign
+    }
+
     // ── GET /api/operations/orders ──
     @GetMapping("/orders")
     public ResponseEntity<List<Map<String, Object>>> listOrders(
@@ -116,47 +124,19 @@ public OperationsOrderController(
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         Map<String, Object> result = orderToMap(order);
-        result.put("latestSnapshot", comprehensiveDataService.getLatest(id));
+        // result.put("latestSnapshot", comprehensiveDataService.getLatest(id));
         result.put("versions", comprehensiveDataService.getVersions(id));
 
         // Attach provider search snapshot
         snapshotRepository.findByOrderId(id).ifPresent(snap -> {
             try {
-                Map<String, Object> transformed =
-                        objectMapper.readValue(
-                                snap.getTransformedReportJson(),
-                                new TypeReference<Map<String, Object>>() {}
-                        );
-
-                Map<String, Object> snapshotData = new LinkedHashMap<>();
-
-                // exact frontend-friendly shape
-                Object versionInfo = transformed.get("versionInfo");
-                if (versionInfo == null) {
-                    versionInfo = Map.of(
-                            "version", 1,
-                            "provider", "PROBE42",
-                            "fetchedAt", OffsetDateTime.now().toString(),
-                            "fetchedBy", "operations"
-                    );
-                }
-
-                snapshotData.put("versionInfo", versionInfo);
-                snapshotData.put("metadata", transformed.get("metadata"));
-
-                Object data = transformed.get("data");
-                if (data == null) {
-                    Map<String, Object> fallback = new LinkedHashMap<>(transformed);
-                    fallback.remove("metadata");
-                    fallback.remove("versionInfo");
-                    data = fallback;
-                }
-
-                snapshotData.put("data", data);
-                result.put("providerSearchSnapshot", snapshotData);
-
+                result.put(
+                        "snapshotData",
+                        snap.getRawResultsJson() != null
+                                ? objectMapper.readValue(snap.getRawResultsJson(), Object.class)
+                                : null);
             } catch (Exception e) {
-                log.warn("Failed to parse snapshot for order {}", id, e);
+                log.warn("Failed to parse raw snapshot for order {}", id, e);
             }
         });
 
@@ -171,7 +151,8 @@ public OperationsOrderController(
             if (enrich.getDecisionOutputsJson() != null) {
                 try {
                     enrichData.put("decisionOutputs", objectMapper.readValue(
-                            enrich.getDecisionOutputsJson(), new TypeReference<Map<String, Object>>() {}));
+                            enrich.getDecisionOutputsJson(), new TypeReference<Map<String, Object>>() {
+                            }));
                 } catch (Exception e) {
                     log.warn("Failed to parse decision outputs for order {}", id, e);
                 }
@@ -195,43 +176,103 @@ public OperationsOrderController(
         return ResponseEntity.ok(result);
     }
 
+    // ── GET /api/operations/orders/{id}/versions/{version} ──
+    @GetMapping("/orders/{id}/versions/{version}")
+    public ResponseEntity<Map<String, Object>> getVersion(@PathVariable Long id, @PathVariable Integer version) {
+        // 1. Fetch the order with all details
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+
+        // 2. Fetch the specific version snapshot
+        RawComprehensiveData snapshot = rawRepository.findByOrder_IdOrderByVersionDesc(id).stream()
+                .filter(s -> version.equals(s.getVersion()))
+                .findFirst()
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Version not found"));
+
+        // 3. Build response: start with the full order map (includes versions list,
+        // etc.)
+        Map<String, Object> result = orderToMap(order);
+
+        // 4. Add version-specific fields (override if any conflict, but orderToMap
+        // doesn't have these)
+        result.put("version", snapshot.getVersion());
+        result.put("fetchedAt", snapshot.getFetchedAt().toString());
+        result.put("fetchedBy", snapshot.getFetchedBy());
+
+        // 5. Add the snapshot data
+        try {
+            result.put("snapshotData", objectMapper.readValue(snapshot.getRawJson(), Object.class));
+        } catch (Exception e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to parse version data");
+        }
+
+        return ResponseEntity.ok(result);
+    }
+
     // ── POST /api/operations/orders/{id}/fetch-data ──
-@PostMapping("/orders/{id}/fetch-data")
-public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
-    Order order = orderRepository.findByIdWithDetails(id)
-            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+    @PostMapping("/orders/{id}/fetch-data")
+    public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-    String identifier = comprehensiveDataService.resolveIdentifier(order);
-    if (identifier == null || identifier.isBlank()) {
-        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
+        String identifier = comprehensiveDataService.resolveIdentifier(order);
+        if (identifier == null || identifier.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
+        }
+
+        Map<String, Object> saved;
+        try {
+            saved = comprehensiveDataService.fetchAndStoreFresh(
+                    order,
+                    identifier,
+                    "operations");
+        } catch (RuntimeException ex) {
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, ex.getMessage());
+        }
+
+        order.setStatus(OrderStatus.DATA_FETCHED);
+        orderRepository.save(order);
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("status", "data_fetched");
+        response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
+        response.put("versions", comprehensiveDataService.getVersions(id));
+        response.put("snapshotData", saved.get("snapshotData"));
+        response.put("latest", saved);
+
+        return ResponseEntity.ok(response);
     }
 
-    Map<String, Object> saved;
-    try {
-        saved = comprehensiveDataService.fetchAndStoreFresh(
-                order,
-                identifier,
-                "operations"
-        );
-    } catch (RuntimeException ex) {
-        throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, ex.getMessage());
+    // constructor: add creditReportService
+
+    @PostMapping("/orders/{id}/generate-credit-report")
+    public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Long id) {
+        try {
+            creditReportService.generateCreditReport(id); // void, async
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("status", "accepted");
+            response.put("message", "Credit report generation started");
+            response.put("orderId", id);
+            return ResponseEntity.accepted().body(response);
+        } catch (RuntimeException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", e.getMessage()));
+        }
     }
 
-    order.setStatus(OrderStatus.DATA_FETCHED);
-    orderRepository.save(order);
+    @GetMapping("/orders/{id}/credit-report")
+    public ResponseEntity<Map<String, Object>> getCreditReport(@PathVariable Long id) {
+        Map<String, Object> report = creditReportService.getLatestCreditReport(id);
+        if (report == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(report);
+    }
 
-    Map<String, Object> response = new LinkedHashMap<>();
-    response.put("status", "data_fetched");
-    response.put("latest", saved);
-    response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
-    response.put("versions", comprehensiveDataService.getVersions(id));
-
-    return ResponseEntity.ok(response);
-}
     // ── PUT /api/operations/orders/{id}/enrichment ──
     @PutMapping("/orders/{id}/enrichment")
     public ResponseEntity<Map<String, Object>> saveEnrichment(@PathVariable Long id,
-                                                               @RequestBody Map<String, Object> body) {
+            @RequestBody Map<String, Object> body) {
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
@@ -277,19 +318,22 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        // Get the transformed report data
+        // Get the raw data
         Map<String, Object> latest = comprehensiveDataService.getLatest(id);
 
-        if (latest == null || latest.get("report") == null) {
+        if (latest == null || latest.get("snapshotData") == null) {
             throw new ResponseStatusException(
                     HttpStatus.BAD_REQUEST,
-                    "No company data fetched yet. Please fetch data first."
-            );
+                    "No company data fetched yet. Please fetch data first.");
         }
 
         @SuppressWarnings("unchecked")
-        Map<String, Object> reportData =
-        (Map<String, Object>) latest.get("report");
+        Map<String, Object> rawPayload = (Map<String, Object>) latest.get("snapshotData");
+        JsonNode rawNode = objectMapper.valueToTree(rawPayload);
+        Map<String, Object> reportData = reportDataService.transformToReport(
+                rawNode,
+                order.getSubjectName(),
+                comprehensiveDataService.resolveIdentifier(order));
 
         // Run decision engine
         Map<String, Object> decisionOutputs = decisionEngineService.execute(reportData);
@@ -322,18 +366,21 @@ public ResponseEntity<Map<String, Object>> fetchData(@PathVariable Long id) {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
         // Get report data
-       Map<String, Object> latest = comprehensiveDataService.getLatest(id);
+        Map<String, Object> latest = comprehensiveDataService.getLatest(id);
 
-if (latest == null || latest.get("report") == null) {
-    throw new ResponseStatusException(
-            HttpStatus.BAD_REQUEST,
-            "No company data fetched yet. Please fetch data first."
-    );
-}
+        if (latest == null || latest.get("snapshotData") == null) {
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_REQUEST,
+                    "No company data fetched yet. Please fetch data first.");
+        }
 
-@SuppressWarnings("unchecked")
-Map<String, Object> reportData =
-        (Map<String, Object>) latest.get("report");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> rawPayload = (Map<String, Object>) latest.get("snapshotData");
+        JsonNode rawNode = objectMapper.valueToTree(rawPayload);
+        Map<String, Object> reportData = reportDataService.transformToReport(
+                rawNode,
+                order.getSubjectName(),
+                comprehensiveDataService.resolveIdentifier(order));
 
         // Get enrichment
         AnalystEnrichment enrichment = enrichmentRepository.findByOrderId(id).orElse(null);
@@ -348,7 +395,8 @@ Map<String, Object> reportData =
             if (enrichment.getDecisionOutputsJson() != null) {
                 try {
                     decisionOutputs = objectMapper.readValue(enrichment.getDecisionOutputsJson(),
-                            new TypeReference<Map<String, Object>>() {});
+                            new TypeReference<Map<String, Object>>() {
+                            });
                 } catch (Exception e) {
                     log.warn("Failed to parse decision outputs for PDF generation", e);
                 }
@@ -361,8 +409,7 @@ Map<String, Object> reportData =
                 order.getSubjectName(),
                 reportData,
                 enrichmentMap,
-                decisionOutputs
-        );
+                decisionOutputs);
 
         String pdfBase64 = Base64.getEncoder().encodeToString(pdfBytes);
         String fileName = "DDR-" + order.getOrderNumber() + ".pdf";
@@ -387,8 +434,7 @@ Map<String, Object> reportData =
         return ResponseEntity.ok(Map.of(
                 "status", "ready",
                 "fileName", fileName,
-                "documentId", doc.getId()
-        ));
+                "documentId", doc.getId()));
     }
 
     // ── POST /api/operations/orders/{id}/publish ──
@@ -426,8 +472,7 @@ Map<String, Object> reportData =
         return ResponseEntity.ok(Map.of(
                 "status", "completed",
                 "message", "Report published and client notified",
-                "completedAt", order.getCompletedAt().toString()
-        ));
+                "completedAt", order.getCompletedAt().toString()));
     }
 
     // ── GET /api/operations/client-companies ──
@@ -449,22 +494,19 @@ Map<String, Object> reportData =
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getStats() {
         List<Order> all = orderRepository.findAll();
-        long pending = all.stream().filter(o ->
-                o.getStatus() == OrderStatus.ORDER_PLACED ||
-                        o.getStatus() == OrderStatus.PENDING_DATA_FETCH ||
-                        o.getStatus() == OrderStatus.DATA_FETCHED).count();
-        long inProgress = all.stream().filter(o ->
-                o.getStatus() == OrderStatus.IN_PROGRESS ||
-                        o.getStatus() == OrderStatus.MODEL_EXECUTED ||
-                        o.getStatus() == OrderStatus.PDF_GENERATED).count();
+        long pending = all.stream().filter(o -> o.getStatus() == OrderStatus.ORDER_PLACED ||
+                o.getStatus() == OrderStatus.PENDING_DATA_FETCH ||
+                o.getStatus() == OrderStatus.DATA_FETCHED).count();
+        long inProgress = all.stream().filter(o -> o.getStatus() == OrderStatus.IN_PROGRESS ||
+                o.getStatus() == OrderStatus.MODEL_EXECUTED ||
+                o.getStatus() == OrderStatus.PDF_GENERATED).count();
         long completed = all.stream().filter(o -> o.getStatus() == OrderStatus.COMPLETED).count();
 
         return ResponseEntity.ok(Map.of(
                 "pendingOrders", pending,
                 "inProgressOrders", inProgress,
                 "completedToday", completed, // simplified
-                "avgCompletionHours", 24
-        ));
+                "avgCompletionHours", 24));
     }
 
     // ── Helpers ──
@@ -487,22 +529,46 @@ Map<String, Object> reportData =
         m.put("createdAt", o.getCreatedAt() != null ? o.getCreatedAt().toString() : null);
         m.put("updatedAt", o.getUpdatedAt() != null ? o.getUpdatedAt().toString() : null);
         m.put("completedAt", o.getCompletedAt() != null ? o.getCompletedAt().toString() : null);
+
+        // Include versions summary (without snapshotData)
+        List<Map<String, Object>> versions = rawRepository.findByOrder_IdOrderByVersionDesc(o.getId())
+                .stream()
+                .map(this::snapshotSummaryToMap)
+                .collect(Collectors.toList());
+        m.put("versions", versions);
+
+        // Include generated documents summary
+        List<GeneratedDocument> docs = documentRepository.findByOrderId(o.getId());
+        List<Map<String, Object>> docList = docs.stream().map(d -> {
+            Map<String, Object> dm = new LinkedHashMap<>();
+            dm.put("id", d.getId());
+            dm.put("documentType", d.getDocumentType());
+            dm.put("status", d.getStatus());
+            dm.put("fileName", d.getFileName());
+            return dm;
+        }).toList();
+        m.put("generatedDocuments", docList);
+
         return m;
     }
 
     private Object parseJson(String json) {
-        if (json == null || json.isBlank()) return null;
+        if (json == null || json.isBlank())
+            return null;
         try {
-            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {
+            });
         } catch (Exception e) {
             return json;
         }
     }
 
     private List<String> parseJsonList(String json) {
-        if (json == null || json.isBlank()) return List.of();
+        if (json == null || json.isBlank())
+            return List.of();
         try {
-            return objectMapper.readValue(json, new TypeReference<List<String>>() {});
+            return objectMapper.readValue(json, new TypeReference<List<String>>() {
+            });
         } catch (Exception e) {
             return List.of();
         }
@@ -510,5 +576,25 @@ Map<String, Object> reportData =
 
     private String strVal(Object o) {
         return o != null ? String.valueOf(o) : "";
+    }
+
+    private Map<String, Object> snapshotSummaryToMap(RawComprehensiveData s) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", s.getId());
+        m.put("version", s.getVersion());
+        m.put("provider", s.getProvider());
+        m.put("cin", s.getCin());
+        m.put("companyName", s.getCompanyName());
+        m.put("fetchedAt", s.getFetchedAt() != null ? s.getFetchedAt().toString() : null);
+        m.put("fetchedBy", s.getFetchedBy());
+        return m;
+    }
+
+    private JsonNode getLatestRawNode(Long orderId) {
+        Map<String, Object> latest = comprehensiveDataService.getLatest(orderId);
+        if (latest == null || latest.get("snapshotData") == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No snapshot data");
+        }
+        return objectMapper.valueToTree(latest.get("snapshotData"));
     }
 }

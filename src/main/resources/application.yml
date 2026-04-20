@@ -57,6 +57,13 @@ security:
     expiration: ${JWT_EXPIRATION:86400000}
 
 # ============================================================
+# PYTHON MODEL CONFIGURATION
+# ============================================================
+python:
+  model:
+    url: ${PYTHON_MODEL_URL:http://35.244.1.113:8003/api/v1/credit-report/generate}
+
+# ============================================================
 # LOGGING CONFIGURATION
 # ============================================================
 logging:

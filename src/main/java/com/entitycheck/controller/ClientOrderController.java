@@ -3,8 +3,12 @@ package com.entitycheck.controller;
 import com.entitycheck.model.*;
 import com.entitycheck.repository.*;
 import com.entitycheck.service.ComprehensiveDataService;
+import com.entitycheck.service.CreditReportService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.*;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -20,6 +24,8 @@ import java.util.concurrent.ThreadLocalRandom;
 @RequestMapping("/api/client")
 public class ClientOrderController {
 
+    private static final Logger log = LoggerFactory.getLogger(ClientOrderController.class);
+
     private final UserRepository userRepository;
     private final OrderRepository orderRepository;
     private final ProductRepository productRepository;
@@ -27,14 +33,18 @@ public class ClientOrderController {
     private final GeneratedDocumentRepository generatedDocumentRepository;
     private final ObjectMapper objectMapper;
     private final ComprehensiveDataService comprehensiveDataService;
+    private final CreditReportService creditReportService;
 
-    public ClientOrderController(UserRepository userRepository,
-                                  OrderRepository orderRepository,
-                                  ProductRepository productRepository,
-                                  ClientProductRepository clientProductRepository,
-                                  GeneratedDocumentRepository generatedDocumentRepository,
-                                  ObjectMapper objectMapper,
-                                  ComprehensiveDataService comprehensiveDataService) {
+    public ClientOrderController(
+            UserRepository userRepository,
+            OrderRepository orderRepository,
+            ProductRepository productRepository,
+            ClientProductRepository clientProductRepository,
+            GeneratedDocumentRepository generatedDocumentRepository,
+            ObjectMapper objectMapper,
+            ComprehensiveDataService comprehensiveDataService,
+            CreditReportService creditReportService) {
+
         this.userRepository = userRepository;
         this.orderRepository = orderRepository;
         this.productRepository = productRepository;
@@ -42,6 +52,7 @@ public class ClientOrderController {
         this.generatedDocumentRepository = generatedDocumentRepository;
         this.objectMapper = objectMapper;
         this.comprehensiveDataService = comprehensiveDataService;
+        this.creditReportService = creditReportService;
     }
 
     // ── GET /api/client/entitlements ──
@@ -61,7 +72,7 @@ public class ClientOrderController {
             e.put("clientCompanyName", cp.getClientCompany().getName());
             e.put("productId", cp.getProduct().getId());
             e.put("productName", cp.getProduct().getName());
-            e.put("code", cp.getProduct().getCode()); // frontend looks for .code
+            e.put("code", cp.getProduct().getCode());
             e.put("productCode", cp.getProduct().getCode());
             e.put("grantedAt", cp.getGrantedAt() != null ? cp.getGrantedAt().toString() : null);
             result.add(e);
@@ -184,7 +195,17 @@ public class ClientOrderController {
             response.put("autoFetchMessage", "Order is processed and data is fetched successfully.");
             response.put("latestSnapshot", comprehensiveDataService.getLatest(saved.getId()));
             response.put("versions", comprehensiveDataService.getVersions(saved.getId()));
-            response.put("fetchedSummary", fetched);
+            response.put("snapshotData", fetched.get("snapshotData"));
+
+            // Trigger async credit report generation
+            try {
+                creditReportService.generateCreditReport(saved.getId());
+                log.info("Async credit report generation triggered for order {}", saved.getId());
+            } catch (Exception e) {
+                log.warn("Failed to trigger credit report generation for order {}: {}", saved.getId(), e.getMessage());
+                // Do not fail the response
+            }
+
         } catch (RuntimeException ex) {
             response.put("autoFetchStatus", "failed");
             response.put(

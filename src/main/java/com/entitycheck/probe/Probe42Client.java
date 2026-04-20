@@ -213,7 +213,7 @@ public class Probe42Client {
 
     HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
-      log.info("Probe42 response: {}", response.body());
+      log.debug("Probe42 response status: {}", response.statusCode());
 
     if (response.statusCode() < 200 || response.statusCode() >= 300) {
       return List.of();
@@ -264,18 +264,18 @@ public JsonNode getComprehensiveByIdentifier(String identifier) throws IOExcepti
             
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         
-        log.info("Probe42 response status: {} for URL: {}", response.statusCode(), url);
+        log.debug("Probe42 response status: {} for URL: {}", response.statusCode(), url);
         
         if (response.statusCode() >= 200 && response.statusCode() < 300) {
             return mapper.readTree(response.body());
         } else if (response.statusCode() == 403) {
-            log.error("Probe42 API returned 403 Forbidden. Check API key validity. Response: {}", response.body());
+            log.error("Probe42 API returned 403 Forbidden. Check API key validity.");
             throw new RuntimeException("Probe42 API authentication failed (403). Please check your API key.");
         } else if (response.statusCode() == 401) {
-            log.error("Probe42 API returned 401 Unauthorized. Response: {}", response.body());
+            log.error("Probe42 API returned 401 Unauthorized.");
             throw new RuntimeException("Probe42 API unauthorized (401). Please check your API key.");
         } else {
-            log.warn("Probe42 API returned {} for URL: {}. Response: {}", response.statusCode(), url, response.body());
+            log.warn("Probe42 API returned {} for URL: {}", response.statusCode(), url);
         }
     }
     return null;

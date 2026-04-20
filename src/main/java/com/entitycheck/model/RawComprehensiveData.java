@@ -36,10 +36,6 @@ public class RawComprehensiveData {
     @Column(columnDefinition = "jsonb", nullable = false)
     private String rawJson;
 
-    @JdbcTypeCode(SqlTypes.JSON)
-    @Column(columnDefinition = "jsonb")
-    private String transformedJson;
-
     @Column(nullable = false)
     private OffsetDateTime fetchedAt;
 
