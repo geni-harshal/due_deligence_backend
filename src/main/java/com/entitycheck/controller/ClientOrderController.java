@@ -1,23 +1,47 @@
 package com.entitycheck.controller;
 
-import com.entitycheck.model.*;
-import com.entitycheck.repository.*;
+import com.entitycheck.model.ClientProduct;
+import com.entitycheck.model.GeneratedDocument;
+import com.entitycheck.model.Order;
+import com.entitycheck.model.OrderStatus;
+import com.entitycheck.model.Product;
+import com.entitycheck.model.User;
+import com.entitycheck.repository.ClientProductRepository;
+import com.entitycheck.repository.GeneratedDocumentRepository;
+import com.entitycheck.repository.OrderRepository;
+import com.entitycheck.repository.ProductRepository;
+import com.entitycheck.repository.UserRepository;
 import com.entitycheck.service.ComprehensiveDataService;
 import com.entitycheck.service.CreditReportService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.*;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 
 @RestController
@@ -55,7 +79,11 @@ public class ClientOrderController {
         this.creditReportService = creditReportService;
     }
 
-    // ── GET /api/client/entitlements ──
+    @PostConstruct
+    public void init() {
+        log.info("ClientOrderController initialized");
+    }
+
     @GetMapping("/entitlements")
     public ResponseEntity<List<Map<String, Object>>> getEntitlements() {
         User user = getCurrentUser();
@@ -63,199 +91,243 @@ public class ClientOrderController {
             return ResponseEntity.ok(List.of());
         }
 
-        List<ClientProduct> cps = clientProductRepository.findByClientCompanyId(user.getClientCompany().getId());
-        List<Map<String, Object>> result = new ArrayList<>();
-        for (ClientProduct cp : cps) {
-            Map<String, Object> e = new LinkedHashMap<>();
-            e.put("id", cp.getId());
-            e.put("clientCompanyId", cp.getClientCompany().getId());
-            e.put("clientCompanyName", cp.getClientCompany().getName());
-            e.put("productId", cp.getProduct().getId());
-            e.put("productName", cp.getProduct().getName());
-            e.put("code", cp.getProduct().getCode());
-            e.put("productCode", cp.getProduct().getCode());
-            e.put("grantedAt", cp.getGrantedAt() != null ? cp.getGrantedAt().toString() : null);
-            result.add(e);
-        }
+        List<ClientProduct> mappings = clientProductRepository.findByClientCompanyId(user.getClientCompany().getId());
+        List<Map<String, Object>> data = mappings.stream().map(cp -> {
+            Product p = cp.getProduct();
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", cp.getId());
+            m.put("productId", p != null ? p.getId() : null);
+            m.put("code", p != null ? p.getCode() : null);
+            m.put("name", p != null ? p.getName() : null);
+            m.put("description", p != null ? p.getDescription() : null);
+            m.put("grantedAt", cp.getGrantedAt() != null ? cp.getGrantedAt().toString() : null);
+            return m;
+        }).toList();
 
-        // If no entitlements exist yet, provide a default DDR entitlement for demo
-        if (result.isEmpty()) {
-            Product ddr = productRepository.findAll().stream()
-                    .filter(p -> "DDR".equals(p.getCode()))
-                    .findFirst().orElse(null);
-            if (ddr != null) {
-                Map<String, Object> e = new LinkedHashMap<>();
-                e.put("id", 0);
-                e.put("productId", ddr.getId());
-                e.put("productName", ddr.getName());
-                e.put("code", ddr.getCode());
-                e.put("productCode", ddr.getCode());
-                result.add(e);
-            }
-        }
-
-        return ResponseEntity.ok(result);
+        return ResponseEntity.ok(data);
     }
 
-    // ── GET /api/client/stats ──
-    @GetMapping("/stats")
-    public ResponseEntity<Map<String, Object>> getStats() {
-        User user = getCurrentUser();
-        Long companyId = user.getClientCompany() != null ? user.getClientCompany().getId() : null;
-        Map<String, Object> stats = new LinkedHashMap<>();
-        if (companyId != null) {
-            long total = orderRepository.countByClientCompanyId(companyId);
-            long completed = orderRepository.countByClientCompanyIdAndStatus(companyId, OrderStatus.COMPLETED);
-            long pending = total - completed;
-            stats.put("totalOrders", total);
-            stats.put("completedOrders", completed);
-            stats.put("pendingOrders", pending);
-            stats.put("ordersThisMonth", total); // simplified
-        }
-        return ResponseEntity.ok(stats);
-    }
-
-    // ── GET /api/client/orders ──
     @GetMapping("/orders")
-    public ResponseEntity<List<Map<String, Object>>> listOrders() {
+    public ResponseEntity<List<Map<String, Object>>> listMyOrders() {
         User user = getCurrentUser();
         if (user.getClientCompany() == null) {
             return ResponseEntity.ok(List.of());
         }
 
         List<Order> orders = orderRepository.findByClientCompanyIdWithDetails(user.getClientCompany().getId());
-        List<Map<String, Object>> result = orders.stream().map(this::orderToMap).toList();
-        return ResponseEntity.ok(result);
+        List<Map<String, Object>> data = orders.stream().map(o -> {
+            Map<String, Object> m = orderToMap(o);
+            generatedDocumentRepository.findByOrderIdAndDocumentType(o.getId(), "due_diligence_report")
+                    .ifPresent(doc -> {
+                        m.put("pdfStatus", doc.getStatus());
+                        m.put("pdfFileName", doc.getFileName());
+                        m.put("previewUrl", "/api/client/orders/" + o.getId() + "/preview-pdf");
+                        m.put("downloadUrl", "/api/client/orders/" + o.getId() + "/download-pdf");
+                    });
+            return m;
+        }).toList();
+
+        return ResponseEntity.ok(data);
     }
 
-    // ── POST /api/client/orders ──
-    @PostMapping("/orders")
-    public ResponseEntity<Map<String, Object>> createOrder(@RequestBody Map<String, Object> body) {
-        User user = getCurrentUser();
-        if (user.getClientCompany() == null) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "User has no associated client company");
-        }
-
-        Long productId = toLong(body.get("productId"));
-        @SuppressWarnings("unchecked")
-        Map<String, Object> selectedCompany = (Map<String, Object>) body.get("selectedCompany");
-        String notes = (String) body.getOrDefault("notes", "");
-
-        if (productId == null || selectedCompany == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "productId and selectedCompany are required");
-        }
-
-        Product product = productRepository.findById(productId)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Product not found"));
-
-        // Build the order
-        Order order = new Order();
-        order.setClientCompany(user.getClientCompany());
-        order.setProduct(product);
-        order.setSubjectName(strVal(selectedCompany.get("companyName")));
-        order.setSubjectType(strVal(selectedCompany.getOrDefault("companyType", "Company")));
-
-        // Store subject details as JSON
-        Map<String, Object> details = new LinkedHashMap<>();
-        details.put("cin", strVal(selectedCompany.get("cin")));
-        details.put("city", strVal(selectedCompany.get("city")));
-        details.put("state", strVal(selectedCompany.get("state")));
-        details.put("status", strVal(selectedCompany.get("status")));
-        try {
-            order.setSubjectDetails(objectMapper.writeValueAsString(details));
-        } catch (Exception e) {
-            order.setSubjectDetails("{}");
-        }
-
-        order.setNotes(notes);
-        order.setStatus(OrderStatus.ORDER_PLACED);
-        order.setPriority(Priority.NORMAL);
-
-        // Generate order number: ORD-YYYYMM-XXXXX
-        String yearMonth = OffsetDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMM"));
-        String rand = String.format("%05d", ThreadLocalRandom.current().nextInt(100000));
-        order.setOrderNumber("ORD-" + yearMonth + "-" + rand);
-
-        Order saved = orderRepository.save(order);
-
-        // Advance to pending_data_fetch
-        saved.setStatus(OrderStatus.PENDING_DATA_FETCH);
-        saved = orderRepository.save(saved);
-
-        Map<String, Object> response = new LinkedHashMap<>(orderToMap(saved));
-        String identifier = comprehensiveDataService.resolveIdentifier(saved);
-        try {
-            Map<String, Object> fetched = comprehensiveDataService.fetchAndStoreFresh(saved, identifier, "client_auto");
-            saved.setStatus(OrderStatus.DATA_FETCHED);
-            saved = orderRepository.save(saved);
-
-            response.clear();
-            response.putAll(orderToMap(saved));
-            response.put("autoFetchStatus", "success");
-            response.put("autoFetchMessage", "Order is processed and data is fetched successfully.");
-            response.put("latestSnapshot", comprehensiveDataService.getLatest(saved.getId()));
-            response.put("versions", comprehensiveDataService.getVersions(saved.getId()));
-            response.put("snapshotData", fetched.get("snapshotData"));
-
-            // Trigger async credit report generation
-            try {
-                creditReportService.generateCreditReport(saved.getId());
-                log.info("Async credit report generation triggered for order {}", saved.getId());
-            } catch (Exception e) {
-                log.warn("Failed to trigger credit report generation for order {}: {}", saved.getId(), e.getMessage());
-                // Do not fail the response
-            }
-
-        } catch (RuntimeException ex) {
-            response.put("autoFetchStatus", "failed");
-            response.put(
-                    "autoFetchMessage",
-                    "Order was placed successfully, but automatic data fetch failed. Operations can use re-fetch."
-            );
-            response.put("autoFetchError", ex.getMessage());
-        }
-
-        return ResponseEntity.ok(response);
-    }
-
-    // ── GET /api/client/orders/{id}/download-pdf ──
-    @GetMapping("/orders/{id}/download-pdf")
-    public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
+    @GetMapping("/orders/{id}/credit-report")
+    public ResponseEntity<Map<String, Object>> getMyCreditReport(@PathVariable Long id) {
         User user = getCurrentUser();
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        // Tenant isolation
         if (user.getClientCompany() == null ||
                 !order.getClientCompany().getId().equals(user.getClientCompany().getId())) {
             throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied");
         }
 
-        if (order.getStatus() != OrderStatus.COMPLETED) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Report not yet completed");
+        Map<String, Object> report = creditReportService.getLatestCreditReport(id);
+        if (report == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(report);
+    }
+
+    @GetMapping("/stats")
+    public ResponseEntity<Map<String, Object>> getStats() {
+        User user = getCurrentUser();
+        if (user.getClientCompany() == null) {
+            return ResponseEntity.ok(Map.of(
+                    "totalOrders", 0,
+                    "pendingOrders", 0,
+                    "completedOrders", 0,
+                    "ordersThisMonth", 0));
+        }
+
+        List<Order> orders = orderRepository.findByClientCompanyIdWithDetails(user.getClientCompany().getId());
+        OffsetDateTime now = OffsetDateTime.now();
+
+        long pending = orders.stream()
+                .filter(o -> o.getStatus() != OrderStatus.COMPLETED && o.getStatus() != OrderStatus.CANCELLED)
+                .count();
+        long completed = orders.stream().filter(o -> o.getStatus() == OrderStatus.COMPLETED).count();
+        long thisMonth = orders.stream()
+                .filter(o -> o.getCreatedAt() != null
+                        && o.getCreatedAt().getYear() == now.getYear()
+                        && o.getCreatedAt().getMonth() == now.getMonth())
+                .count();
+
+        return ResponseEntity.ok(Map.of(
+                "totalOrders", orders.size(),
+                "pendingOrders", pending,
+                "completedOrders", completed,
+                "ordersThisMonth", thisMonth));
+    }
+
+    @PostMapping("/orders")
+    public ResponseEntity<Map<String, Object>> createOrder(@RequestBody Map<String, Object> body) {
+        User user = getCurrentUser();
+        if (user.getClientCompany() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Current user has no client company");
+        }
+
+        Long productId = toLong(body.get("productId"));
+        if (productId == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "productId is required");
+        }
+
+        Product product = productRepository.findById(productId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid productId"));
+
+        boolean entitled = clientProductRepository.findByClientCompanyId(user.getClientCompany().getId()).stream()
+                .anyMatch(cp -> cp.getProduct() != null && Objects.equals(cp.getProduct().getId(), productId));
+        if (!entitled) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Client is not entitled to this product");
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> selectedCompany = body.get("selectedCompany") instanceof Map
+                ? (Map<String, Object>) body.get("selectedCompany")
+                : Map.of();
+
+        String subjectName = strVal(selectedCompany.get("companyName"));
+        if (subjectName.isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "selectedCompany.companyName is required");
+        }
+
+        String cin = strVal(selectedCompany.get("cin"));
+        String entityType = strVal(body.get("entityType"));
+        if (entityType.isBlank()) {
+            entityType = "Company";
+        }
+
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("cin", cin);
+        details.put("city", strVal(selectedCompany.get("city")));
+        details.put("state", strVal(selectedCompany.get("state")));
+        details.put("status", strVal(selectedCompany.get("status")));
+        details.put("companyType", strVal(selectedCompany.get("companyType")));
+
+        Order order = new Order();
+        order.setOrderNumber(generateOrderNumber());
+        order.setClientCompany(user.getClientCompany());
+        order.setProduct(product);
+        order.setSubjectName(subjectName);
+        order.setSubjectType(entityType);
+        order.setNotes(strVal(body.get("notes")));
+        try {
+            order.setSubjectDetails(objectMapper.writeValueAsString(details));
+        } catch (Exception e) {
+            order.setSubjectDetails("{}");
+        }
+        order.setStatus(OrderStatus.ORDER_PLACED);
+        orderRepository.save(order);
+
+        String autoFetchStatus = "pending";
+        String autoFetchMessage = "Order created. Data fetch has not started.";
+        if (!cin.isBlank()) {
+            try {
+                comprehensiveDataService.fetchAndStoreFresh(order, cin, "client");
+                order.setStatus(OrderStatus.DATA_FETCHED);
+                orderRepository.save(order);
+                creditReportService.generateCreditReport(order.getId());
+
+                autoFetchStatus = "success";
+                autoFetchMessage = "Company data fetched. Credit report generation started.";
+            } catch (Exception ex) {
+                log.warn("Auto-fetch failed for order {}: {}", order.getId(), ex.getMessage());
+                order.setStatus(OrderStatus.PENDING_DATA_FETCH);
+                orderRepository.save(order);
+                autoFetchStatus = "failed";
+                autoFetchMessage = "Order created, but Probe42 fetch failed. Operations can retry fetch.";
+            }
+        }
+
+        Map<String, Object> response = orderToMap(order);
+        response.put("autoFetchStatus", autoFetchStatus);
+        response.put("autoFetchMessage", autoFetchMessage);
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    @GetMapping("/orders/{id}/preview-pdf")
+    public ResponseEntity<byte[]> previewPdf(@PathVariable Long id) {
+        User user = getCurrentUser();
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+
+        if (user.getClientCompany() == null ||
+                !order.getClientCompany().getId().equals(user.getClientCompany().getId())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied");
         }
 
         GeneratedDocument doc = generatedDocumentRepository
                 .findByOrderIdAndDocumentType(id, "due_diligence_report")
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
 
-        if (!"ready".equals(doc.getStatus()) || doc.getPdfBase64() == null) {
+        if (!"ready".equals(doc.getStatus()) || doc.getFilePath() == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not ready");
         }
 
-        byte[] pdfBytes = Base64.getDecoder().decode(doc.getPdfBase64());
-
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_PDF);
-        headers.setContentDisposition(
-                ContentDisposition.builder("attachment")
-                        .filename(doc.getFileName() != null ? doc.getFileName() : "report.pdf")
-                        .build()
-        );
-        return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
+        try {
+            byte[] pdfBytes = Files.readAllBytes(Paths.get(doc.getFilePath()));
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_PDF);
+            headers.setContentDisposition(ContentDisposition.inline().filename(doc.getFileName()).build());
+            return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
+        } catch (IOException e) {
+            log.error("Failed to read PDF file: {}", doc.getFilePath(), e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Unable to read PDF file");
+        }
     }
 
-    // ── Helpers ──
+    @GetMapping("/orders/{id}/download-pdf")
+    public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
+        User user = getCurrentUser();
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+
+        if (user.getClientCompany() == null ||
+                !order.getClientCompany().getId().equals(user.getClientCompany().getId())) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied");
+        }
+
+        GeneratedDocument doc = generatedDocumentRepository
+                .findByOrderIdAndDocumentType(id, "due_diligence_report")
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
+
+        if (!"ready".equals(doc.getStatus()) || doc.getFilePath() == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not ready");
+        }
+
+        try {
+            byte[] pdfBytes = Files.readAllBytes(Paths.get(doc.getFilePath()));
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_PDF);
+            headers.setContentDisposition(
+                    ContentDisposition.builder("attachment")
+                            .filename(doc.getFileName() != null ? doc.getFileName() : "report.pdf")
+                            .build());
+            return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
+        } catch (IOException e) {
+            log.error("Failed to read PDF file: {}", doc.getFilePath(), e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Unable to read PDF file");
+        }
+    }
 
     private User getCurrentUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();
@@ -286,9 +358,12 @@ public class ClientOrderController {
     }
 
     private Object parseJson(String json) {
-        if (json == null || json.isBlank()) return null;
+        if (json == null || json.isBlank()) {
+            return null;
+        }
         try {
-            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+            return objectMapper.readValue(json, new TypeReference<Map<String, Object>>() {
+            });
         } catch (Exception e) {
             return json;
         }
@@ -299,10 +374,22 @@ public class ClientOrderController {
     }
 
     private Long toLong(Object o) {
-        if (o instanceof Number) return ((Number) o).longValue();
-        if (o instanceof String) {
-            try { return Long.parseLong((String) o); } catch (Exception e) { return null; }
+        if (o instanceof Number) {
+            return ((Number) o).longValue();
+        }
+        if (o instanceof String s) {
+            try {
+                return Long.parseLong(s);
+            } catch (Exception e) {
+                return null;
+            }
         }
         return null;
+    }
+
+    private String generateOrderNumber() {
+        String yyMm = OffsetDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMM"));
+        int random = ThreadLocalRandom.current().nextInt(10000, 99999);
+        return "ORD-" + yyMm + "-" + random;
     }
 }

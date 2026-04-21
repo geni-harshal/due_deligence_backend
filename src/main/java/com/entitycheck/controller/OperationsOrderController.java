@@ -4,7 +4,7 @@ import com.entitycheck.model.*;
 import com.entitycheck.probe.Probe42Client;
 import com.entitycheck.repository.*;
 import com.entitycheck.service.DecisionEngineService;
-import com.entitycheck.service.OrderPdfService;
+import com.entitycheck.service.PdfGenerationService;
 import com.entitycheck.service.ReportDataService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -22,6 +22,11 @@ import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
+import org.springframework.beans.factory.annotation.Value;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.io.IOException;
 
 @RestController
 @RequestMapping("/api/operations")
@@ -37,10 +42,13 @@ public class OperationsOrderController {
     private final Probe42Client probe42Client;
     private final ReportDataService reportDataService;
     private final DecisionEngineService decisionEngineService;
-    private final OrderPdfService orderPdfService;
+    private final PdfGenerationService pdfGenerationService;
     private final ObjectMapper objectMapper;
     private final ComprehensiveDataService comprehensiveDataService;
     private final CreditReportService creditReportService; // ← Only once here
+
+    @Value("${app.storage.pdf-path:./storage/reports}")
+    private String pdfStoragePath;
 
     public OperationsOrderController(
             OrderRepository orderRepository,
@@ -52,7 +60,7 @@ public class OperationsOrderController {
             Probe42Client probe42Client,
             ReportDataService reportDataService,
             DecisionEngineService decisionEngineService,
-            OrderPdfService orderPdfService,
+            PdfGenerationService pdfGenerationService,
             ObjectMapper objectMapper,
             ComprehensiveDataService comprehensiveDataService,
             CreditReportService creditReportService) { // ← Parameter present
@@ -66,7 +74,7 @@ public class OperationsOrderController {
         this.probe42Client = probe42Client;
         this.reportDataService = reportDataService;
         this.decisionEngineService = decisionEngineService;
-        this.orderPdfService = orderPdfService;
+        this.pdfGenerationService = pdfGenerationService;
         this.objectMapper = objectMapper;
         this.comprehensiveDataService = comprehensiveDataService;
         this.creditReportService = creditReportService; // ← Must assign
@@ -359,85 +367,82 @@ public class OperationsOrderController {
         return ResponseEntity.ok(decisionOutputs);
     }
 
-    // ── POST /api/operations/orders/{id}/generate-pdf ──
+    // Trigger asynchronous PDF generation from the latest generated credit report.
     @PostMapping("/orders/{id}/generate-pdf")
     public ResponseEntity<Map<String, Object>> generatePdf(@PathVariable Long id) {
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        // Get report data
-        Map<String, Object> latest = comprehensiveDataService.getLatest(id);
-
-        if (latest == null || latest.get("snapshotData") == null) {
-            throw new ResponseStatusException(
-                    HttpStatus.BAD_REQUEST,
-                    "No company data fetched yet. Please fetch data first.");
+        if (order.getStatus() == OrderStatus.REPORT_GENERATING) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "status", "report_generating",
+                    "message", "Credit report is still generating. Retry PDF generation shortly."));
         }
 
-        @SuppressWarnings("unchecked")
-        Map<String, Object> rawPayload = (Map<String, Object>) latest.get("snapshotData");
-        JsonNode rawNode = objectMapper.valueToTree(rawPayload);
-        Map<String, Object> reportData = reportDataService.transformToReport(
-                rawNode,
-                order.getSubjectName(),
-                comprehensiveDataService.resolveIdentifier(order));
-
-        // Get enrichment
-        AnalystEnrichment enrichment = enrichmentRepository.findByOrderId(id).orElse(null);
-        Map<String, Object> enrichmentMap = null;
-        Map<String, Object> decisionOutputs = null;
-        if (enrichment != null) {
-            enrichmentMap = new LinkedHashMap<>();
-            enrichmentMap.put("investigationSummary", enrichment.getInvestigationSummary());
-            enrichmentMap.put("analystComments", enrichment.getAnalystComments());
-            enrichmentMap.put("recommendationNotes", enrichment.getRecommendationNotes());
-            enrichmentMap.put("redFlags", parseJsonList(enrichment.getRedFlagsJson()));
-            if (enrichment.getDecisionOutputsJson() != null) {
-                try {
-                    decisionOutputs = objectMapper.readValue(enrichment.getDecisionOutputsJson(),
-                            new TypeReference<Map<String, Object>>() {
-                            });
-                } catch (Exception e) {
-                    log.warn("Failed to parse decision outputs for PDF generation", e);
-                }
-            }
+        if (order.getStatus() != OrderStatus.REPORT_GENERATED
+                && order.getStatus() != OrderStatus.PDF_GENERATING
+                && order.getStatus() != OrderStatus.PDF_GENERATED
+                && order.getStatus() != OrderStatus.COMPLETED) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Credit report is not ready yet. Generate the credit report first.");
         }
 
-        // Generate PDF
-        byte[] pdfBytes = orderPdfService.generateDDRPdf(
-                order.getOrderNumber(),
-                order.getSubjectName(),
-                reportData,
-                enrichmentMap,
-                decisionOutputs);
+        pdfGenerationService.generatePdfFromReport(id);
 
-        String pdfBase64 = Base64.getEncoder().encodeToString(pdfBytes);
-        String fileName = "DDR-" + order.getOrderNumber() + ".pdf";
-
-        // Upsert generated document
-        GeneratedDocument doc = documentRepository.findByOrderIdAndDocumentType(id, "due_diligence_report")
-                .orElseGet(() -> {
-                    GeneratedDocument gd = new GeneratedDocument();
-                    gd.setOrder(order);
-                    gd.setDocumentType("due_diligence_report");
-                    return gd;
-                });
-        doc.setStatus("ready");
-        doc.setPdfBase64(pdfBase64);
-        doc.setFileName(fileName);
-        documentRepository.save(doc);
-
-        // Update order status
-        order.setStatus(OrderStatus.PDF_GENERATED);
-        orderRepository.save(order);
-
-        return ResponseEntity.ok(Map.of(
-                "status", "ready",
-                "fileName", fileName,
-                "documentId", doc.getId()));
+        return ResponseEntity.accepted().body(Map.of(
+                "status", "accepted",
+                "message", "PDF generation started",
+                "orderId", id));
     }
 
-    // ── POST /api/operations/orders/{id}/publish ──
+    @GetMapping("/orders/{id}/pdf-status")
+    public ResponseEntity<Map<String, Object>> getPdfStatus(@PathVariable Long id) {
+        Order order = orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+
+        Optional<GeneratedDocument> docOpt = documentRepository.findByOrderIdAndDocumentType(id, "due_diligence_report");
+        if (docOpt.isPresent()) {
+            GeneratedDocument doc = docOpt.get();
+            return ResponseEntity.ok(Map.of(
+                    "status", doc.getStatus(),
+                    "orderStatus", order.getStatus().name().toLowerCase(),
+                    "fileName", doc.getFileName() != null ? doc.getFileName() : "",
+                    "ready", "ready".equalsIgnoreCase(doc.getStatus())));
+        }
+
+        boolean generating = order.getStatus() == OrderStatus.PDF_GENERATING;
+        return ResponseEntity.ok(Map.of(
+                "status", generating ? "generating" : "not_ready",
+                "orderStatus", order.getStatus().name().toLowerCase(),
+                "ready", false));
+    }
+
+    @GetMapping("/orders/{id}/download-pdf")
+    public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
+        orderRepository.findByIdWithDetails(id)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+
+        GeneratedDocument doc = documentRepository.findByOrderIdAndDocumentType(id, "due_diligence_report")
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
+
+        if (!"ready".equalsIgnoreCase(doc.getStatus()) || doc.getFilePath() == null || doc.getFilePath().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not ready");
+        }
+
+        try {
+            byte[] pdfBytes = Files.readAllBytes(Paths.get(doc.getFilePath()));
+            return ResponseEntity.ok()
+                    .header("Content-Type", "application/pdf")
+                    .header("Content-Disposition", "attachment; filename=\"" +
+                            (doc.getFileName() != null ? doc.getFileName() : "report.pdf") + "\"")
+                    .body(pdfBytes);
+        } catch (IOException e) {
+            log.error("Failed to read PDF file for order {} at {}", id, doc.getFilePath(), e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Unable to read PDF file");
+        }
+    }
+
+
     @PostMapping("/orders/{id}/publish")
     public ResponseEntity<Map<String, Object>> publish(@PathVariable Long id) {
         Order order = orderRepository.findByIdWithDetails(id)

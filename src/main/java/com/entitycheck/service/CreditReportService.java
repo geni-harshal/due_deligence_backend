@@ -3,7 +3,6 @@ package com.entitycheck.service;
 import com.entitycheck.model.*;
 import com.entitycheck.repository.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -25,6 +24,7 @@ public class CreditReportService {
     private final OrderRepository orderRepository;
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
+    private final PdfGenerationService pdfGenerationService;
 
     @Value("${python.model.url}")
     private String pythonModelUrl;
@@ -32,69 +32,63 @@ public class CreditReportService {
     public CreditReportService(RawComprehensiveDataRepository rawRepository,
                                CreditReportRepository creditReportRepository,
                                OrderRepository orderRepository,
-                               ObjectMapper objectMapper) {
+                               ObjectMapper objectMapper,
+                               PdfGenerationService pdfGenerationService) {
         this.rawRepository = rawRepository;
         this.creditReportRepository = creditReportRepository;
         this.orderRepository = orderRepository;
         this.objectMapper = objectMapper;
         this.restTemplate = new RestTemplate();
+        this.pdfGenerationService = pdfGenerationService;
     }
 
-    /**
-     * Asynchronously generates a credit report for the given order.
-     * The report is fetched from the Python model and stored in the database.
-     * This method does not return a value; any errors are logged.
-     */
     @Async
     @Transactional
     public void generateCreditReport(Long orderId) {
         log.info("Starting async credit report generation for orderId: {}", orderId);
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() -> new RuntimeException("Order not found: " + orderId));
+
+        order.setStatus(OrderStatus.REPORT_GENERATING);
+        orderRepository.save(order);
 
         try {
-            // 1. Get Order
-            Order order = orderRepository.findById(orderId)
-                    .orElseThrow(() -> new RuntimeException("Order not found"));
-            log.debug("Order found: {}", order.getOrderNumber());
-
-            // 2. Fetch latest raw JSON version
             RawComprehensiveData latestRaw = rawRepository
                     .findTopByOrder_IdOrderByVersionDesc(orderId)
-                    .orElseThrow(() -> new RuntimeException("No raw data found for order"));
-            log.debug("Latest raw data version: {}, fetchedAt: {}", latestRaw.getVersion(), latestRaw.getFetchedAt());
-
+                    .orElseThrow(() -> new RuntimeException("No raw data found for order " + orderId));
             String rawJson = latestRaw.getRawJson();
-            log.debug("Raw JSON length: {} characters", rawJson.length());
 
-            // 3. Prepare request to Python model
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<String> requestEntity = new HttpEntity<>(rawJson, headers);
 
-            // 4. Call Python model
             log.info("Calling Python model at URL: {}", pythonModelUrl);
             ResponseEntity<String> response = restTemplate.postForEntity(pythonModelUrl, requestEntity, String.class);
-            log.info("Python model responded with status: {}", response.getStatusCode());
 
             if (!response.getStatusCode().is2xxSuccessful()) {
-                log.error("Python model returned non-2xx status: {} - body: {}", response.getStatusCode(), response.getBody());
                 throw new RuntimeException("Python model returned error: " + response.getStatusCode());
             }
-
             String reportJson = response.getBody();
-            log.info("Received report JSON of length: {}", reportJson != null ? reportJson.length() : 0);
 
-            // 5. Store in DB
             CreditReport report = new CreditReport();
             report.setOrder(order);
             report.setVersion(latestRaw.getVersion());
             report.setReportData(reportJson);
-            report.setStatus("generated");
+            report.setStatus("GENERATED");
             creditReportRepository.save(report);
-            log.info("Credit report saved with id: {} for orderId: {}", report.getId(), orderId);
+
+            order.setStatus(OrderStatus.REPORT_GENERATED);
+            orderRepository.save(order);
+
+            log.info("Credit report generated and saved for orderId: {}", orderId);
+
+            // Trigger PDF generation
+            pdfGenerationService.generatePdfFromReport(orderId);
 
         } catch (Exception e) {
             log.error("Credit report generation failed for orderId {}: {}", orderId, e.getMessage(), e);
-            // Optionally save a failure record
+            order.setStatus(OrderStatus.DATA_FETCHED); // fallback
+            orderRepository.save(order);
         }
     }
 

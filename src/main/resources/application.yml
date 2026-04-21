@@ -74,6 +74,9 @@ logging:
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
 
+app:
+  storage:
+    pdf-path: ${PDF_STORAGE_PATH:./storage/reports}
 # ============================================================
 # ACTUATOR & MONITORING
 # ============================================================

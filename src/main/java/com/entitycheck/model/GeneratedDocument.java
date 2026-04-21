@@ -8,6 +8,7 @@ import java.time.OffsetDateTime;
 @Table(name = "generated_documents")
 @Data
 public class GeneratedDocument {
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
@@ -17,15 +18,17 @@ public class GeneratedDocument {
     private Order order;
 
     @Column(nullable = false)
-    private String documentType; // "due_diligence_report", "lien_report", etc.
+    private String documentType;
 
     @Column(nullable = false)
     private String status; // "generating", "ready", "failed"
 
-    @Column(columnDefinition = "TEXT")
-    private String pdfBase64; // base64-encoded PDF content
-
     private String fileName;
+
+    @Column(name = "file_path")
+    private String filePath;   // NEW: path to PDF file on disk
+
+    // Remove pdfBase64 field
 
     private OffsetDateTime createdAt;
     private OffsetDateTime updatedAt;

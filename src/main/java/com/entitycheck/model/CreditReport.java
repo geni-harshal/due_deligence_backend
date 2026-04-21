@@ -4,6 +4,7 @@ import jakarta.persistence.*;
 import lombok.Data;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
+
 import java.time.OffsetDateTime;
 
 @Entity
@@ -22,12 +23,12 @@ public class CreditReport {
     @Column(nullable = false)
     private Integer version;
 
-    @JdbcTypeCode(SqlTypes.JSON)                     // ✅ ADD THIS
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb", nullable = false)
     private String reportData;
 
     @Column(nullable = false)
-    private String status;
+    private String status;  // GENERATING, GENERATED, FAILED
 
     private OffsetDateTime createdAt;
     private OffsetDateTime updatedAt;
