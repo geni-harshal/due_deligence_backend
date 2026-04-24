@@ -4,6 +4,7 @@ import com.entitycheck.model.*;
 import com.entitycheck.repository.*;
 import com.entitycheck.service.ComprehensiveDataService;
 import com.entitycheck.service.CreditReportService;
+import com.entitycheck.service.AuditLogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -34,6 +35,7 @@ public class ClientOrderController {
     private final ObjectMapper objectMapper;
     private final ComprehensiveDataService comprehensiveDataService;
     private final CreditReportService creditReportService;
+    private final AuditLogService auditLogService;
 
     public ClientOrderController(
             UserRepository userRepository,
@@ -43,7 +45,8 @@ public class ClientOrderController {
             GeneratedDocumentRepository generatedDocumentRepository,
             ObjectMapper objectMapper,
             ComprehensiveDataService comprehensiveDataService,
-            CreditReportService creditReportService) {
+            CreditReportService creditReportService,
+            AuditLogService auditLogService) {
 
         this.userRepository = userRepository;
         this.orderRepository = orderRepository;
@@ -53,6 +56,7 @@ public class ClientOrderController {
         this.objectMapper = objectMapper;
         this.comprehensiveDataService = comprehensiveDataService;
         this.creditReportService = creditReportService;
+        this.auditLogService = auditLogService;
     }
 
     // ── GET /api/client/entitlements ──
@@ -177,17 +181,20 @@ public class ClientOrderController {
         order.setOrderNumber("ORD-" + yearMonth + "-" + rand);
 
         Order saved = orderRepository.save(order);
+        logOrderEvent(saved, "client_order_created", "Client created a new order", "client_user");
 
         // Advance to pending_data_fetch
-        saved.setStatus(OrderStatus.PENDING_DATA_FETCH);
-        saved = orderRepository.save(saved);
+        saved = transitionStatus(saved, OrderStatus.PENDING_DATA_FETCH, "client_order_pending_data_fetch",
+                "Order moved to pending data fetch", "system");
 
         Map<String, Object> response = new LinkedHashMap<>(orderToMap(saved));
         String identifier = comprehensiveDataService.resolveIdentifier(saved);
         try {
+            saved = transitionStatus(saved, OrderStatus.DATA_FETCH_IN_PROGRESS, "client_data_fetch_started",
+                    "Automatic data fetch started", "system");
             Map<String, Object> fetched = comprehensiveDataService.fetchAndStoreFresh(saved, identifier, "client_auto");
-            saved.setStatus(OrderStatus.DATA_FETCHED);
-            saved = orderRepository.save(saved);
+            saved = transitionStatus(saved, OrderStatus.DATA_FETCHED, "client_data_fetch_completed",
+                    "Automatic data fetch completed", "system");
 
             response.clear();
             response.putAll(orderToMap(saved));
@@ -200,6 +207,8 @@ public class ClientOrderController {
             // Trigger async credit report generation
             try {
                 creditReportService.generateCreditReport(saved.getId());
+                logOrderEvent(saved, "client_credit_report_triggered", "Automatic credit report generation triggered",
+                        "system");
                 log.info("Async credit report generation triggered for order {}", saved.getId());
             } catch (Exception e) {
                 log.warn("Failed to trigger credit report generation for order {}: {}", saved.getId(), e.getMessage());
@@ -207,6 +216,8 @@ public class ClientOrderController {
             }
 
         } catch (RuntimeException ex) {
+            logOrderEvent(saved, "client_data_fetch_failed",
+                    "Automatic data fetch failed: " + ex.getMessage(), "system");
             response.put("autoFetchStatus", "failed");
             response.put(
                     "autoFetchMessage",
@@ -219,43 +230,106 @@ public class ClientOrderController {
     }
 
     // ── GET /api/client/orders/{id}/download-pdf ──
-    @GetMapping("/orders/{id}/download-pdf")
-    public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
-        User user = getCurrentUser();
-        Order order = orderRepository.findByIdWithDetails(id)
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+    // @GetMapping("/orders/{id}/download-pdf")
+    // public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
+    //     User user = getCurrentUser();
+    //     Order order = orderRepository.findByIdWithDetails(id)
+    //             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        // Tenant isolation
-        if (user.getClientCompany() == null ||
-                !order.getClientCompany().getId().equals(user.getClientCompany().getId())) {
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied");
-        }
+    //     // Tenant isolation
+    //     if (user.getClientCompany() == null ||
+    //             !order.getClientCompany().getId().equals(user.getClientCompany().getId())) {
+    //         throw new ResponseStatusException(HttpStatus.FORBIDDEN, "Access denied");
+    //     }
 
-        if (order.getStatus() != OrderStatus.COMPLETED) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Report not yet completed");
-        }
+    //     if (order.getStatus() != OrderStatus.COMPLETED) {
+    //         throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Report not yet completed");
+    //     }
 
-        GeneratedDocument doc = generatedDocumentRepository
-                .findByOrderIdAndDocumentType(id, "due_diligence_report")
-                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
+    //     GeneratedDocument doc = generatedDocumentRepository
+    //             .findByOrderIdAndDocumentType(id, "due_diligence_report")
+    //             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
 
-        if (!"ready".equals(doc.getStatus()) || doc.getPdfBase64() == null) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not ready");
-        }
+    //     if (!"ready".equals(doc.getStatus()) || doc.getPdfBase64() == null) {
+    //         throw new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not ready");
+    //     }
 
-        byte[] pdfBytes = Base64.getDecoder().decode(doc.getPdfBase64());
+    //     byte[] pdfBytes = Base64.getDecoder().decode(doc.getPdfBase64());
 
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_PDF);
-        headers.setContentDisposition(
-                ContentDisposition.builder("attachment")
-                        .filename(doc.getFileName() != null ? doc.getFileName() : "report.pdf")
-                        .build()
-        );
-        return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
+    //     HttpHeaders headers = new HttpHeaders();
+    //     headers.setContentType(MediaType.APPLICATION_PDF);
+    //     headers.setContentDisposition(
+    //             ContentDisposition.builder("attachment")
+    //                     .filename(doc.getFileName() != null ? doc.getFileName() : "report.pdf")
+    //                     .build()
+    //     );
+    //     return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
+    // }
+
+    @GetMapping("/orders/{id}/pdf/preview")
+public ResponseEntity<byte[]> previewPdf(@PathVariable Long id) {
+    GeneratedDocument doc = getPdfDocument(id);
+    return ResponseEntity.ok()
+            .contentType(MediaType.APPLICATION_PDF)
+            .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + doc.getFileName() + "\"")
+            .body(Base64.getDecoder().decode(doc.getPdfBase64()));
+}
+
+@GetMapping("/orders/{id}/pdf/download")
+public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
+    GeneratedDocument doc = getPdfDocument(id);
+    return ResponseEntity.ok()
+            .contentType(MediaType.APPLICATION_PDF)
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + doc.getFileName() + "\"")
+            .body(Base64.getDecoder().decode(doc.getPdfBase64()));
+}
+
+private GeneratedDocument getPdfDocument(Long orderId) {
+    // Tenant isolation
+    User user = getCurrentUser();
+    Order order = orderRepository.findByIdWithDetails(orderId)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+    if (user.getClientCompany() == null || !order.getClientCompany().getId().equals(user.getClientCompany().getId())) {
+        throw new ResponseStatusException(HttpStatus.FORBIDDEN);
     }
+    return generatedDocumentRepository
+            .findByOrderIdAndDocumentType(orderId, "credit_report")
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
+}
 
     // ── Helpers ──
+
+    private Order transitionStatus(
+            Order order,
+            OrderStatus nextStatus,
+            String action,
+            String message,
+            String actor) {
+        if (order.getStatus() == nextStatus) {
+            return order;
+        }
+        OrderStatus previous = order.getStatus();
+        order.setStatus(nextStatus);
+        Order saved = orderRepository.save(order);
+        auditLogService.logStatusChange(
+                saved,
+                previous,
+                nextStatus,
+                action,
+                message,
+                actor,
+                Map.of("orderId", saved.getId(), "orderNumber", saved.getOrderNumber()));
+        return saved;
+    }
+
+    private void logOrderEvent(Order order, String action, String message, String actor) {
+        auditLogService.logEvent(
+                order,
+                action,
+                message,
+                actor,
+                Map.of("orderId", order.getId(), "orderNumber", order.getOrderNumber()));
+    }
 
     private User getCurrentUser() {
         Authentication auth = SecurityContextHolder.getContext().getAuthentication();

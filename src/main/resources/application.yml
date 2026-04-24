@@ -74,6 +74,9 @@ logging:
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
 
+pdf:
+  service:
+    url: http://localhost:3001/generate-pdf
 # ============================================================
 # ACTUATOR & MONITORING
 # ============================================================

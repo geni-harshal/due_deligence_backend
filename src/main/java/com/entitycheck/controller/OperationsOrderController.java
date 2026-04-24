@@ -6,6 +6,7 @@ import com.entitycheck.repository.*;
 import com.entitycheck.service.DecisionEngineService;
 import com.entitycheck.service.OrderPdfService;
 import com.entitycheck.service.ReportDataService;
+import com.entitycheck.service.AuditLogService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,6 +41,7 @@ public class OperationsOrderController {
     private final OrderPdfService orderPdfService;
     private final ObjectMapper objectMapper;
     private final ComprehensiveDataService comprehensiveDataService;
+    private final AuditLogService auditLogService;
     private final CreditReportService creditReportService; // ← Only once here
 
     public OperationsOrderController(
@@ -55,7 +57,8 @@ public class OperationsOrderController {
             OrderPdfService orderPdfService,
             ObjectMapper objectMapper,
             ComprehensiveDataService comprehensiveDataService,
-            CreditReportService creditReportService) { // ← Parameter present
+            CreditReportService creditReportService,
+            AuditLogService auditLogService) { // ← Parameter present
 
         this.orderRepository = orderRepository;
         this.clientCompanyRepository = clientCompanyRepository;
@@ -69,6 +72,7 @@ public class OperationsOrderController {
         this.orderPdfService = orderPdfService;
         this.objectMapper = objectMapper;
         this.comprehensiveDataService = comprehensiveDataService;
+        this.auditLogService = auditLogService;
         this.creditReportService = creditReportService; // ← Must assign
     }
 
@@ -220,6 +224,9 @@ public class OperationsOrderController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "No CIN/identifier found for this order");
         }
 
+        transitionStatus(order, OrderStatus.DATA_FETCH_IN_PROGRESS, "ops_fetch_started",
+                "Operations data fetch started", "operations_user");
+
         Map<String, Object> saved;
         try {
             saved = comprehensiveDataService.fetchAndStoreFresh(
@@ -227,11 +234,12 @@ public class OperationsOrderController {
                     identifier,
                     "operations");
         } catch (RuntimeException ex) {
+            logOrderEvent(order, "ops_fetch_failed", "Operations data fetch failed: " + ex.getMessage(), "operations_user");
             throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, ex.getMessage());
         }
 
-        order.setStatus(OrderStatus.DATA_FETCHED);
-        orderRepository.save(order);
+        transitionStatus(order, OrderStatus.DATA_FETCHED, "ops_fetch_completed",
+                "Operations data fetch completed", "operations_user");
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("status", "data_fetched");
@@ -248,6 +256,10 @@ public class OperationsOrderController {
     @PostMapping("/orders/{id}/generate-credit-report")
     public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Long id) {
         try {
+            Order order = orderRepository.findById(id)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+            logOrderEvent(order, "ops_credit_report_triggered", "Operations triggered credit report generation",
+                    "operations_user");
             creditReportService.generateCreditReport(id); // void, async
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("status", "accepted");
@@ -364,6 +376,8 @@ public class OperationsOrderController {
     public ResponseEntity<Map<String, Object>> generatePdf(@PathVariable Long id) {
         Order order = orderRepository.findByIdWithDetails(id)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
+        transitionStatus(order, OrderStatus.PDF_GENERATION_IN_PROGRESS, "ops_pdf_generation_started",
+                "Operations PDF generation started", "operations_user");
 
         // Get report data
         Map<String, Object> latest = comprehensiveDataService.getLatest(id);
@@ -403,13 +417,20 @@ public class OperationsOrderController {
             }
         }
 
-        // Generate PDF
-        byte[] pdfBytes = orderPdfService.generateDDRPdf(
-                order.getOrderNumber(),
-                order.getSubjectName(),
-                reportData,
-                enrichmentMap,
-                decisionOutputs);
+        byte[] pdfBytes;
+        try {
+            // Generate PDF
+            pdfBytes = orderPdfService.generateDDRPdf(
+                    order.getOrderNumber(),
+                    order.getSubjectName(),
+                    reportData,
+                    enrichmentMap,
+                    decisionOutputs);
+        } catch (Exception ex) {
+            transitionStatus(order, OrderStatus.PDF_GENERATION_FAILED, "ops_pdf_generation_failed",
+                    "Operations PDF generation failed: " + ex.getMessage(), "operations_user");
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to generate PDF");
+        }
 
         String pdfBase64 = Base64.getEncoder().encodeToString(pdfBytes);
         String fileName = "DDR-" + order.getOrderNumber() + ".pdf";
@@ -427,9 +448,8 @@ public class OperationsOrderController {
         doc.setFileName(fileName);
         documentRepository.save(doc);
 
-        // Update order status
-        order.setStatus(OrderStatus.PDF_GENERATED);
-        orderRepository.save(order);
+        transitionStatus(order, OrderStatus.PDF_GENERATED, "ops_pdf_generation_completed",
+                "Operations PDF generation completed", "operations_user");
 
         return ResponseEntity.ok(Map.of(
                 "status", "ready",
@@ -461,9 +481,12 @@ public class OperationsOrderController {
         }
 
         // Mark as completed
+        OrderStatus previousStatus = order.getStatus();
         order.setStatus(OrderStatus.COMPLETED);
         order.setCompletedAt(OffsetDateTime.now());
         orderRepository.save(order);
+        auditLogService.logStatusChange(order, previousStatus, OrderStatus.COMPLETED, "ops_order_published",
+                "Operations published report", "operations_user", Map.of("orderId", order.getId()));
 
         log.info("Order {} published successfully. Client {} notified (mock).",
                 order.getOrderNumber(),
@@ -496,9 +519,13 @@ public class OperationsOrderController {
         List<Order> all = orderRepository.findAll();
         long pending = all.stream().filter(o -> o.getStatus() == OrderStatus.ORDER_PLACED ||
                 o.getStatus() == OrderStatus.PENDING_DATA_FETCH ||
+                o.getStatus() == OrderStatus.DATA_FETCH_IN_PROGRESS ||
                 o.getStatus() == OrderStatus.DATA_FETCHED).count();
         long inProgress = all.stream().filter(o -> o.getStatus() == OrderStatus.IN_PROGRESS ||
+                o.getStatus() == OrderStatus.CREDIT_REPORT_GENERATION_IN_PROGRESS ||
+                o.getStatus() == OrderStatus.CREDIT_REPORT_GENERATED ||
                 o.getStatus() == OrderStatus.MODEL_EXECUTED ||
+                o.getStatus() == OrderStatus.PDF_GENERATION_IN_PROGRESS ||
                 o.getStatus() == OrderStatus.PDF_GENERATED).count();
         long completed = all.stream().filter(o -> o.getStatus() == OrderStatus.COMPLETED).count();
 
@@ -510,6 +537,37 @@ public class OperationsOrderController {
     }
 
     // ── Helpers ──
+
+    private void transitionStatus(
+            Order order,
+            OrderStatus nextStatus,
+            String action,
+            String message,
+            String actor) {
+        if (order.getStatus() == nextStatus) {
+            return;
+        }
+        OrderStatus previousStatus = order.getStatus();
+        order.setStatus(nextStatus);
+        orderRepository.save(order);
+        auditLogService.logStatusChange(
+                order,
+                previousStatus,
+                nextStatus,
+                action,
+                message,
+                actor,
+                Map.of("orderId", order.getId(), "orderNumber", order.getOrderNumber()));
+    }
+
+    private void logOrderEvent(Order order, String action, String message, String actor) {
+        auditLogService.logEvent(
+                order,
+                action,
+                message,
+                actor,
+                Map.of("orderId", order.getId(), "orderNumber", order.getOrderNumber()));
+    }
 
     private Map<String, Object> orderToMap(Order o) {
         Map<String, Object> m = new LinkedHashMap<>();
