@@ -253,17 +253,17 @@ public class OperationsOrderController {
 
     // constructor: add creditReportService
 
-    @PostMapping("/orders/{id}/generate-credit-report")
-    public ResponseEntity<Map<String, Object>> generateCreditReport(@PathVariable Long id) {
+    @PostMapping("/orders/{id}/generate-report")
+    public ResponseEntity<Map<String, Object>> generateReport(@PathVariable Long id) {
         try {
             Order order = orderRepository.findById(id)
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
-            logOrderEvent(order, "ops_credit_report_triggered", "Operations triggered credit report generation",
+            logOrderEvent(order, "ops_report_triggered", "Operations triggered report generation",
                     "operations_user");
             creditReportService.generateCreditReport(id); // void, async
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("status", "accepted");
-            response.put("message", "Credit report generation started");
+            response.put("message", "Report generation started");
             response.put("orderId", id);
             return ResponseEntity.accepted().body(response);
         } catch (RuntimeException e) {
@@ -522,8 +522,8 @@ public class OperationsOrderController {
                 o.getStatus() == OrderStatus.DATA_FETCH_IN_PROGRESS ||
                 o.getStatus() == OrderStatus.DATA_FETCHED).count();
         long inProgress = all.stream().filter(o -> o.getStatus() == OrderStatus.IN_PROGRESS ||
-                o.getStatus() == OrderStatus.CREDIT_REPORT_GENERATION_IN_PROGRESS ||
-                o.getStatus() == OrderStatus.CREDIT_REPORT_GENERATED ||
+                o.getStatus() == OrderStatus.REPORT_GENERATION_IN_PROGRESS ||
+                o.getStatus() == OrderStatus.REPORT_GENERATED ||
                 o.getStatus() == OrderStatus.MODEL_EXECUTED ||
                 o.getStatus() == OrderStatus.PDF_GENERATION_IN_PROGRESS ||
                 o.getStatus() == OrderStatus.PDF_GENERATED).count();

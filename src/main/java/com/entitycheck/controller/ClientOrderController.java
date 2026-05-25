@@ -204,14 +204,14 @@ public class ClientOrderController {
             response.put("versions", comprehensiveDataService.getVersions(saved.getId()));
             response.put("snapshotData", fetched.get("snapshotData"));
 
-            // Trigger async credit report generation
+            // Trigger async report generation
             try {
                 creditReportService.generateCreditReport(saved.getId());
-                logOrderEvent(saved, "client_credit_report_triggered", "Automatic credit report generation triggered",
+                logOrderEvent(saved, "client_report_triggered", "Automatic report generation triggered",
                         "system");
-                log.info("Async credit report generation triggered for order {}", saved.getId());
+                log.info("Async report generation triggered for order {}", saved.getId());
             } catch (Exception e) {
-                log.warn("Failed to trigger credit report generation for order {}: {}", saved.getId(), e.getMessage());
+                log.warn("Failed to trigger report generation for order {}: {}", saved.getId(), e.getMessage());
                 // Do not fail the response
             }
 
@@ -293,7 +293,7 @@ private GeneratedDocument getPdfDocument(Long orderId) {
         throw new ResponseStatusException(HttpStatus.FORBIDDEN);
     }
     return generatedDocumentRepository
-            .findByOrderIdAndDocumentType(orderId, "credit_report")
+            .findByOrderIdAndDocumentType(orderId, "report")
             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
 }
 

@@ -1,5 +1,6 @@
 package com.entitycheck.model;
 
+import com.entitycheck.converter.OrderStatusConverter;
 import jakarta.persistence.*;
 import lombok.Data;
 import org.hibernate.annotations.JdbcTypeCode;

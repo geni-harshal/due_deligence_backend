@@ -14,9 +14,9 @@ spring:
   # DATABASE CONFIGURATION
   # ============================================================
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/entitycheck}
-    username: ${DB_USER:postgres}
-    password: ${DB_PASSWORD:root}
+    url: ${DB_URL:jdbc:postgresql://35.244.1.113:5432/deligence_pro}
+    username: ${DB_USER:adminuser}
+    password: ${DB_PASSWORD:OYquG97b4OO91ffF}
     driver-class-name: org.postgresql.Driver
   
   # ============================================================
@@ -62,6 +62,7 @@ security:
 python:
   model:
     url: ${PYTHON_MODEL_URL:http://35.244.1.113:8003/api/v1/credit-report/generate}
+    # url: ${PYTHON_MODEL_URL:http://localhost:8000/api/v1/credit-report/generate}
 
 # ============================================================
 # LOGGING CONFIGURATION
@@ -77,6 +78,7 @@ logging:
 pdf:
   service:
     url: http://localhost:3001/generate-pdf
+    # url: http://35.244.1.113:3001/generate-pdf
 # ============================================================
 # ACTUATOR & MONITORING
 # ============================================================

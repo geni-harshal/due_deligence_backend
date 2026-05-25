@@ -71,9 +71,9 @@ public class CreditReportService {
                     .orElseThrow(() -> new RuntimeException("Order not found"));
             updateOrderStatus(
                     order,
-                    OrderStatus.CREDIT_REPORT_GENERATION_IN_PROGRESS,
-                    "credit_report_generation_started",
-                    "Credit report generation started");
+                    OrderStatus.REPORT_GENERATION_IN_PROGRESS,
+                    "report_generation_started",
+                    "Report generation started");
 
             RawComprehensiveData latestRaw = rawRepository
                     .findTopByOrder_IdOrderByVersionDesc(orderId)
@@ -100,9 +100,9 @@ public class CreditReportService {
             creditReportRepository.save(report);
             updateOrderStatus(
                     order,
-                    OrderStatus.CREDIT_REPORT_GENERATED,
-                    "credit_report_generation_completed",
-                    "Credit report generated and stored");
+                    OrderStatus.REPORT_GENERATED,
+                    "report_generation_completed",
+                    "Report generated and stored");
 
             try {
                 updateOrderStatus(
@@ -131,23 +131,23 @@ public class CreditReportService {
             try {
                 orderRepository.findById(orderId).ifPresent(order -> updateOrderStatus(
                         order,
-                        OrderStatus.CREDIT_REPORT_GENERATION_FAILED,
-                        "credit_report_generation_failed",
-                        "Credit report generation failed: " + ex.getMessage()));
+                        OrderStatus.REPORT_GENERATION_FAILED,
+                        "report_generation_failed",
+                        "Report generation failed: " + ex.getMessage()));
             } catch (Exception ignored) {
-                log.warn("Failed to persist credit report failure status for order {}", orderId);
+                log.warn("Failed to persist report failure status for order {}", orderId);
             }
         }
     }
 
     private void storePdf(Order order, Integer version, byte[] pdfBytes) {
         GeneratedDocument doc = documentRepository
-                .findByOrderIdAndDocumentType(order.getId(), "credit_report")
+                .findByOrderIdAndDocumentType(order.getId(), "report")
                 .orElse(new GeneratedDocument());
         doc.setOrder(order);
-        doc.setDocumentType("credit_report");
+        doc.setDocumentType("report");
         doc.setPdfBase64(Base64.getEncoder().encodeToString(pdfBytes));
-        doc.setFileName(String.format("Credit_Report_%s_v%d.pdf", order.getOrderNumber(), version));
+        doc.setFileName(String.format("Report_%s_v%d.pdf", order.getOrderNumber(), version));
         doc.setStatus("ready");
         documentRepository.save(doc);
         log.info("PDF stored in generated_documents for order {} as {}", order.getId(), doc.getFileName());
