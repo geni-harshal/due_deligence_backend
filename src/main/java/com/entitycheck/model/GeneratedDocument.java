@@ -25,6 +25,9 @@ public class GeneratedDocument {
     @Column(columnDefinition = "TEXT")
     private String pdfBase64; // base64-encoded PDF content
 
+    @Column(columnDefinition = "TEXT")
+    private String filePath; // absolute filesystem path
+
     private String fileName;
 
     private OffsetDateTime createdAt;

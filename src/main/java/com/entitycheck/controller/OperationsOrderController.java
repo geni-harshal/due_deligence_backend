@@ -18,6 +18,8 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 import com.entitycheck.service.ComprehensiveDataService;
 import com.entitycheck.service.CreditReportService;
+import com.entitycheck.service.PdfStorageService;
+import com.entitycheck.service.ClientUpdatesPublisher;
 
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
@@ -43,6 +45,8 @@ public class OperationsOrderController {
     private final ComprehensiveDataService comprehensiveDataService;
     private final AuditLogService auditLogService;
     private final CreditReportService creditReportService; // ← Only once here
+    private final PdfStorageService pdfStorageService;
+    private final ClientUpdatesPublisher clientUpdatesPublisher;
 
     public OperationsOrderController(
             OrderRepository orderRepository,
@@ -58,7 +62,9 @@ public class OperationsOrderController {
             ObjectMapper objectMapper,
             ComprehensiveDataService comprehensiveDataService,
             CreditReportService creditReportService,
-            AuditLogService auditLogService) { // ← Parameter present
+            AuditLogService auditLogService,
+            PdfStorageService pdfStorageService,
+            ClientUpdatesPublisher clientUpdatesPublisher) { // ← Parameter present
 
         this.orderRepository = orderRepository;
         this.clientCompanyRepository = clientCompanyRepository;
@@ -74,6 +80,8 @@ public class OperationsOrderController {
         this.comprehensiveDataService = comprehensiveDataService;
         this.auditLogService = auditLogService;
         this.creditReportService = creditReportService; // ← Must assign
+        this.pdfStorageService = pdfStorageService;
+        this.clientUpdatesPublisher = clientUpdatesPublisher;
     }
 
     // ── GET /api/operations/orders ──
@@ -240,9 +248,17 @@ public class OperationsOrderController {
 
         transitionStatus(order, OrderStatus.DATA_FETCHED, "ops_fetch_completed",
                 "Operations data fetch completed", "operations_user");
+        try {
+            creditReportService.generateCreditReport(id);
+            logOrderEvent(order, "ops_report_triggered_after_fetch",
+                    "Automatic report generation triggered after fetch-data", "operations_user");
+        } catch (Exception e) {
+            log.warn("Failed to trigger report generation after fetch-data for order {}: {}", id, e.getMessage());
+        }
 
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("status", "data_fetched");
+        response.put("reportGeneration", "started");
         response.put("latestSnapshot", comprehensiveDataService.getLatest(id));
         response.put("versions", comprehensiveDataService.getVersions(id));
         response.put("snapshotData", saved.get("snapshotData"));
@@ -432,8 +448,8 @@ public class OperationsOrderController {
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to generate PDF");
         }
 
-        String pdfBase64 = Base64.getEncoder().encodeToString(pdfBytes);
-        String fileName = "DDR-" + order.getOrderNumber() + ".pdf";
+        String fileName = "OMNIFI_" + order.getOrderNumber() + ".pdf";
+        String filePath = pdfStorageService.save(pdfBytes, fileName);
 
         // Upsert generated document
         GeneratedDocument doc = documentRepository.findByOrderIdAndDocumentType(id, "due_diligence_report")
@@ -444,7 +460,8 @@ public class OperationsOrderController {
                     return gd;
                 });
         doc.setStatus("ready");
-        doc.setPdfBase64(pdfBase64);
+        doc.setPdfBase64(null);
+        doc.setFilePath(filePath);
         doc.setFileName(fileName);
         documentRepository.save(doc);
 
@@ -550,6 +567,7 @@ public class OperationsOrderController {
         OrderStatus previousStatus = order.getStatus();
         order.setStatus(nextStatus);
         orderRepository.save(order);
+        clientUpdatesPublisher.publishOrderUpdate(order);
         auditLogService.logStatusChange(
                 order,
                 previousStatus,

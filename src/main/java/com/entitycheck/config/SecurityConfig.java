@@ -42,6 +42,7 @@ public class SecurityConfig {
                     "/api/auth/login",
                     "/api/auth/logout",
                     "/api/health",
+                    "/ws/**",
                     "/error",
                     "/swagger-ui.html",
                     "/swagger-ui/**",
@@ -86,7 +87,7 @@ public class SecurityConfig {
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"));
         configuration.setAllowedHeaders(List.of("*"));
         configuration.setAllowCredentials(false);
-        configuration.setExposedHeaders(List.of("Authorization"));
+        configuration.setExposedHeaders(List.of("Authorization", "Content-Disposition"));
         
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", configuration);

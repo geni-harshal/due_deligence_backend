@@ -5,6 +5,8 @@ import com.entitycheck.repository.*;
 import com.entitycheck.service.ComprehensiveDataService;
 import com.entitycheck.service.CreditReportService;
 import com.entitycheck.service.AuditLogService;
+import com.entitycheck.service.PdfStorageService;
+import com.entitycheck.service.ClientUpdatesPublisher;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -36,6 +38,8 @@ public class ClientOrderController {
     private final ComprehensiveDataService comprehensiveDataService;
     private final CreditReportService creditReportService;
     private final AuditLogService auditLogService;
+    private final PdfStorageService pdfStorageService;
+    private final ClientUpdatesPublisher clientUpdatesPublisher;
 
     public ClientOrderController(
             UserRepository userRepository,
@@ -46,7 +50,9 @@ public class ClientOrderController {
             ObjectMapper objectMapper,
             ComprehensiveDataService comprehensiveDataService,
             CreditReportService creditReportService,
-            AuditLogService auditLogService) {
+            AuditLogService auditLogService,
+            PdfStorageService pdfStorageService,
+            ClientUpdatesPublisher clientUpdatesPublisher) {
 
         this.userRepository = userRepository;
         this.orderRepository = orderRepository;
@@ -57,6 +63,8 @@ public class ClientOrderController {
         this.comprehensiveDataService = comprehensiveDataService;
         this.creditReportService = creditReportService;
         this.auditLogService = auditLogService;
+        this.pdfStorageService = pdfStorageService;
+        this.clientUpdatesPublisher = clientUpdatesPublisher;
     }
 
     // ── GET /api/client/entitlements ──
@@ -200,9 +208,6 @@ public class ClientOrderController {
             response.putAll(orderToMap(saved));
             response.put("autoFetchStatus", "success");
             response.put("autoFetchMessage", "Order is processed and data is fetched successfully.");
-            response.put("latestSnapshot", comprehensiveDataService.getLatest(saved.getId()));
-            response.put("versions", comprehensiveDataService.getVersions(saved.getId()));
-            response.put("snapshotData", fetched.get("snapshotData"));
 
             // Trigger async report generation
             try {
@@ -223,7 +228,7 @@ public class ClientOrderController {
                     "autoFetchMessage",
                     "Order was placed successfully, but automatic data fetch failed. Operations can use re-fetch."
             );
-            response.put("autoFetchError", ex.getMessage());
+            response.put("autoFetchError", "AUTO_FETCH_FAILED");
         }
 
         return ResponseEntity.ok(response);
@@ -266,22 +271,24 @@ public class ClientOrderController {
     //     return new ResponseEntity<>(pdfBytes, headers, HttpStatus.OK);
     // }
 
-    @GetMapping("/orders/{id}/pdf/preview")
+@GetMapping("/orders/{id}/pdf/preview")
 public ResponseEntity<byte[]> previewPdf(@PathVariable Long id) {
     GeneratedDocument doc = getPdfDocument(id);
+    byte[] pdfBytes = pdfStorageService.read(doc);
     return ResponseEntity.ok()
             .contentType(MediaType.APPLICATION_PDF)
             .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + doc.getFileName() + "\"")
-            .body(Base64.getDecoder().decode(doc.getPdfBase64()));
+            .body(pdfBytes);
 }
 
 @GetMapping("/orders/{id}/pdf/download")
 public ResponseEntity<byte[]> downloadPdf(@PathVariable Long id) {
     GeneratedDocument doc = getPdfDocument(id);
+    byte[] pdfBytes = pdfStorageService.read(doc);
     return ResponseEntity.ok()
             .contentType(MediaType.APPLICATION_PDF)
             .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + doc.getFileName() + "\"")
-            .body(Base64.getDecoder().decode(doc.getPdfBase64()));
+            .body(pdfBytes);
 }
 
 private GeneratedDocument getPdfDocument(Long orderId) {
@@ -294,6 +301,7 @@ private GeneratedDocument getPdfDocument(Long orderId) {
     }
     return generatedDocumentRepository
             .findByOrderIdAndDocumentType(orderId, "report")
+            .or(() -> generatedDocumentRepository.findByOrderIdAndDocumentType(orderId, "due_diligence_report"))
             .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "PDF not found"));
 }
 
@@ -311,6 +319,7 @@ private GeneratedDocument getPdfDocument(Long orderId) {
         OrderStatus previous = order.getStatus();
         order.setStatus(nextStatus);
         Order saved = orderRepository.save(order);
+        clientUpdatesPublisher.publishOrderUpdate(saved);
         auditLogService.logStatusChange(
                 saved,
                 previous,

@@ -23,7 +23,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.time.OffsetDateTime;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -40,6 +39,8 @@ public class CreditReportService {
     private final PdfGenerationService pdfGenerationService;
     private final GeneratedDocumentRepository documentRepository;
     private final AuditLogService auditLogService;
+    private final PdfStorageService pdfStorageService;
+    private final ClientUpdatesPublisher clientUpdatesPublisher;
 
     @Value("${python.model.url}")
     private String pythonModelUrl;
@@ -51,7 +52,9 @@ public class CreditReportService {
             ObjectMapper objectMapper,
             PdfGenerationService pdfGenerationService,
             GeneratedDocumentRepository documentRepository,
-            AuditLogService auditLogService) {
+            AuditLogService auditLogService,
+            PdfStorageService pdfStorageService,
+            ClientUpdatesPublisher clientUpdatesPublisher) {
         this.rawRepository = rawRepository;
         this.creditReportRepository = creditReportRepository;
         this.orderRepository = orderRepository;
@@ -60,6 +63,8 @@ public class CreditReportService {
         this.pdfGenerationService = pdfGenerationService;
         this.documentRepository = documentRepository;
         this.auditLogService = auditLogService;
+        this.pdfStorageService = pdfStorageService;
+        this.clientUpdatesPublisher = clientUpdatesPublisher;
     }
 
     @Async
@@ -91,6 +96,8 @@ public class CreditReportService {
             String reportJson = response.getBody();
             log.info("Credit report JSON received for order {} ({} chars)", orderId,
                     reportJson != null ? reportJson.length() : 0);
+
+            reportJson = normalizeReportIdPrefix(reportJson);
 
             CreditReport report = new CreditReport();
             report.setOrder(order);
@@ -146,8 +153,11 @@ public class CreditReportService {
                 .orElse(new GeneratedDocument());
         doc.setOrder(order);
         doc.setDocumentType("report");
-        doc.setPdfBase64(Base64.getEncoder().encodeToString(pdfBytes));
-        doc.setFileName(String.format("Report_%s_v%d.pdf", order.getOrderNumber(), version));
+        String fileName = String.format("OMNIFI_%s_v%d.pdf", order.getOrderNumber(), version);
+        String filePath = pdfStorageService.save(pdfBytes, fileName);
+        doc.setFilePath(filePath);
+        doc.setPdfBase64(null);
+        doc.setFileName(fileName);
         doc.setStatus("ready");
         documentRepository.save(doc);
         log.info("PDF stored in generated_documents for order {} as {}", order.getId(), doc.getFileName());
@@ -166,6 +176,7 @@ public class CreditReportService {
         order.setStatus(next);
         orderRepository.save(order);
         log.info("Order {} status transition: {} -> {}", order.getId(), previous, next);
+        clientUpdatesPublisher.publishOrderUpdate(order);
         auditLogService.logStatusChange(
                 order,
                 previous,
@@ -176,6 +187,37 @@ public class CreditReportService {
                 Map.of(
                         "orderId", order.getId(),
                         "orderNumber", order.getOrderNumber()));
+    }
+
+    private String normalizeReportIdPrefix(String reportJson) {
+        try {
+            Map<String, Object> root = objectMapper.readValue(reportJson, new TypeReference<Map<String, Object>>() {});
+            normalizeReportIdInNode(root);
+            return objectMapper.writeValueAsString(root);
+        } catch (Exception ignored) {
+            return reportJson;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void normalizeReportIdInNode(Map<String, Object> node) {
+        if (node == null) return;
+
+        Map<String, Object> meta = null;
+        if (node.get("meta") instanceof Map<?, ?> metaMap) {
+            meta = (Map<String, Object>) metaMap;
+        } else if (node.get("_meta") instanceof Map<?, ?> legacyMetaMap) {
+            meta = (Map<String, Object>) legacyMetaMap;
+        }
+
+        if (meta != null && meta.get("report_id") != null) {
+            String reportId = String.valueOf(meta.get("report_id"));
+            meta.put("report_id", reportId.replaceFirst("^(?i)(GNI|GNL|GENI)-", "OMNIFI-"));
+        }
+
+        if (node.get("report") instanceof Map<?, ?> reportNode) {
+            normalizeReportIdInNode((Map<String, Object>) reportNode);
+        }
     }
 
     public Map<String, Object> getLatestCreditReport(Long orderId) {
